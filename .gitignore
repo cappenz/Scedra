@@ -37,6 +37,8 @@ Secrets.xcconfig
 # Local build / probe junk (do not commit)
 .probe_tmp/
 .sketch_tmp/
+*.sketch
+sketch/
 
 # fastlane
 fastlane/report.xml
