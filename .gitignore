@@ -1,0 +1,45 @@
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Xcode
+xcuserdata/
+*.xcuserstate
+*.xccheckout
+*.xcscmblueprint
+DerivedData/
+*.moved-aside
+*.hmap
+*.ipa
+*.dSYM
+*.dSYM.zip
+timeline.xctimeline
+*.xcresult
+
+# Provisioning / signing material
+*.mobileprovision
+*.provisionprofile
+*.p12
+*.p8
+*.cer
+*.certSigningRequest
+
+# Secrets and local config
+.env
+.env.*
+*.pem
+*.key
+Secrets.xcconfig
+*.xcconfig
+!Example.xcconfig
+
+# Local build / probe junk (do not commit)
+.probe_tmp/
+.sketch_tmp/
+
+# fastlane
+fastlane/report.xml
+fastlane/Preview.html
+fastlane/screenshots/**/*.png
+fastlane/test_output
