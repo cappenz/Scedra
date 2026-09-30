@@ -11,6 +11,8 @@ struct DayTimelineView: View {
     let day: Date
     let items: [TodayItem]
     var metrics: DayTimelineMetrics = .standard
+    /// Don’t-go-home / Conflict / These overlap / Take transit — same ScrollView as the hours.
+    var noticeStops: [HomeGapStop] = []
     var onSelect: (TodayItem) -> Void
     var onDelete: (TodayItem) -> Void
     /// Signed number of days to move by, so the view can drive the existing day picker.
@@ -19,6 +21,7 @@ struct DayTimelineView: View {
     private let gutterWidth: CGFloat = 52
     private let laneInset: CGFloat = 4
     private let cornerRadius: CGFloat = 12
+    private let contentSpace = "scedraTimelineContent"
 
     private var cal: Calendar { .current }
     private var dayStart: Date { cal.startOfDay(for: day) }
@@ -28,26 +31,102 @@ struct DayTimelineView: View {
     private var allDayItems: [TodayItem] { items.filter { $0.isAllDay } }
     private var timedItems: [TodayItem] { items.filter { !$0.isAllDay } }
 
+    @State private var noticeContentFrame: CGRect = .zero
+    @State private var visibleRect: CGRect = .zero
+    @State private var noticeHint: CalendarNoticeHint = .hidden
+
     var body: some View {
-        // Hour grid only. Don’t-go-home / Conflict cards live under the day
-        // header in CalendarTabView — under this 24-hour grid they vanished.
+        // One ScrollView: problem cards above the hours, then the 24-hour grid.
         ScrollViewReader { proxy in
             ScrollView(.vertical, showsIndicators: false) {
-                VStack(spacing: 0) {
-                    if !allDayItems.isEmpty {
-                        allDayStrip
+                VStack(alignment: .leading, spacing: 0) {
+                    if !noticeStops.isEmpty {
+                        HomeGapSection(stops: noticeStops)
+                            .onGeometryChange(for: CGRect.self) { geo in
+                                geo.frame(in: .named(contentSpace))
+                            } action: { _, frame in
+                                noticeContentFrame = frame
+                                refreshNoticeHint()
+                            }
+                            .padding(.bottom, noticeContentFrame.height > 1 ? 16 : 0)
+                            .id(CalendarNoticeChrome.noticeAnchor)
                     }
-                    hourLane
+                    timelineCard
                 }
-                .background(ScedraTheme.card, in: RoundedRectangle(cornerRadius: 28, style: .continuous))
-                .shadow(color: ScedraTheme.purple.opacity(0.12), radius: 18, y: 8)
+                .coordinateSpace(.named(contentSpace))
+            }
+            .onScrollGeometryChange(for: CGRect.self) { geo in
+                geo.visibleRect
+            } action: { _, rect in
+                visibleRect = rect
+                refreshNoticeHint()
+            }
+            .overlay(alignment: noticeHint == .scrollDown ? .bottom : .top) {
+                noticeHintChip(proxy)
+                    .animation(.easeInOut(duration: 0.2), value: noticeHint)
             }
             .overlay(alignment: .bottom) { todayButton }
             .overlay(alignment: .center) { emptyDayNote }
             .onAppear { restInterestingPlace(proxy) }
             .onChange(of: dayStart) { _, _ in restInterestingPlace(proxy) }
+            .onChange(of: noticeStops.isEmpty) { _, empty in
+                if empty {
+                    noticeContentFrame = .zero
+                    noticeHint = .hidden
+                }
+                restInterestingPlace(proxy)
+            }
         }
         .simultaneousGesture(daySwipe)
+    }
+
+    private var timelineCard: some View {
+        VStack(spacing: 0) {
+            if !allDayItems.isEmpty {
+                allDayStrip
+            }
+            hourLane
+        }
+        .background(ScedraTheme.card, in: RoundedRectangle(cornerRadius: 28, style: .continuous))
+        .shadow(color: ScedraTheme.purple.opacity(0.12), radius: 18, y: 8)
+    }
+
+    @ViewBuilder
+    private func noticeHintChip(_ proxy: ScrollViewProxy) -> some View {
+        if noticeHint != .hidden {
+            Button {
+                withAnimation(.easeInOut(duration: 0.25)) {
+                    proxy.scrollTo(CalendarNoticeChrome.noticeAnchor, anchor: .top)
+                }
+            } label: {
+                Text(noticeHint.message)
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(ScedraTheme.deepPurple)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 7)
+                    .background(
+                        ScedraTheme.card.opacity(0.94),
+                        in: Capsule()
+                    )
+                    .overlay(Capsule().stroke(ScedraTheme.lavender.opacity(0.8), lineWidth: 1))
+                    .shadow(color: ScedraTheme.purple.opacity(0.12), radius: 8, y: 3)
+            }
+            .buttonStyle(.plain)
+            .padding(.top, noticeHint == .scrollUp ? 8 : 0)
+            .padding(.bottom, noticeHint == .scrollDown ? (isToday ? 14 : 54) : 0)
+            .accessibilityLabel(noticeHint.message)
+        }
+    }
+
+    private func refreshNoticeHint() {
+        guard !noticeStops.isEmpty else {
+            noticeHint = .hidden
+            return
+        }
+        noticeHint = CalendarNoticeHint.of(
+            noticeFrameInContent: noticeContentFrame,
+            visibleRect: visibleRect
+        )
     }
 
     // MARK: - Grid
@@ -387,6 +466,14 @@ struct DayTimelineView: View {
     }
 
     private func restInterestingPlace(_ proxy: ScrollViewProxy) {
+        // Cards sit above the hours so they aren't buried after 11pm. Skip the
+        // usual jump-to-event when this day has problem cards to show.
+        if !noticeStops.isEmpty {
+            DispatchQueue.main.async {
+                proxy.scrollTo(CalendarNoticeChrome.noticeAnchor, anchor: .top)
+            }
+            return
+        }
         let spans = timedItems.enumerated().map {
             TimelineSpan(id: String($0.offset), start: $0.element.start, end: $0.element.end)
         }

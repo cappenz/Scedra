@@ -104,6 +104,140 @@ final class ScedraHomeGapTests: XCTestCase {
         )
     }
 
+    func testSameLocationGapDoesNotStayOutOrNotify() {
+        let first = stop("a", "Dentist", start: time(14), end: time(15), place: "Valencia")
+        let second = stop("b", "Cleaning", start: time(15, 40), end: time(16, 40), place: "Valencia")
+        XCTAssertTrue(HomeGapLogic.isSamePlace(first, second))
+        XCTAssertNil(
+            advice(first: first, second: second, aToHome: 20, homeToB: 20, aToB: 10, buffer: 5),
+            "same address — she can stay; Don’t go home is not the question"
+        )
+        XCTAssertNil(
+            advice(
+                first: first,
+                second: second,
+                aToHome: 20,
+                homeToB: 20,
+                aToB: 10,
+                buffer: 5,
+                minHome: 30
+            )
+        )
+        XCTAssertTrue(HomeGapNotifier.drafts(from: [], now: time(14, 20)).isEmpty)
+    }
+
+    func testBothHomeStopsAreTheSamePlace() {
+        let lunch = stop("a", "Lunch", start: time(12), end: time(13), usesHome: true)
+        let call = stop("b", "Call", start: time(14), end: time(15), usesHome: true)
+        XCTAssertTrue(HomeGapLogic.isSamePlace(lunch, call))
+        XCTAssertNil(
+            advice(first: lunch, second: call, aToHome: 0, homeToB: 0, aToB: 0, buffer: 5, minHome: 30)
+        )
+    }
+
+    func testSamePlaceStillFlagsImpossibleTravel() throws {
+        let first = stop("a", "Dentist", start: time(14), end: time(15), place: "Valencia")
+        let second = stop("b", "Cleaning", start: time(15, 10), end: time(16), place: "Valencia")
+        let suggestion = try XCTUnwrap(
+            advice(first: first, second: second, aToHome: 20, homeToB: 20, aToB: 25)
+        )
+        XCTAssertEqual(suggestion.kind, .cannotBeLived)
+        XCTAssertEqual(suggestion.headline, String(localized: "Conflict"))
+    }
+
+    func testPinsWithinTightDistanceCountAsSamePlace() {
+        var first = stop("a", "Standup", start: time(14), end: time(15), place: "Office A")
+        first.latitude = 37.44
+        first.longitude = -122.14
+        var near = stop("b", "1:1", start: time(15, 40), end: time(16, 40), place: "Cafe")
+        // ~55 m north — still the same block.
+        near.latitude = 37.4405
+        near.longitude = -122.14
+        var far = stop("c", "Riding", start: time(17), end: time(18), place: "Westwind")
+        far.latitude = 37.3576
+        far.longitude = -122.1503
+        XCTAssertTrue(HomeGapLogic.isSamePlace(first, near))
+        XCTAssertFalse(HomeGapLogic.isSamePlace(first, far))
+        XCTAssertEqual(HomeGapLogic.samePlaceMeters, 80)
+    }
+
+    func testSamePinDifferentNamesDoesNotStayOut() {
+        var office = stop("a", "Standup", start: time(14), end: time(15), place: "Office A")
+        office.latitude = 37.44
+        office.longitude = -122.14
+        var suite = stop("b", "1:1", start: time(15, 40), end: time(16, 40), place: "Suite 2")
+        suite.latitude = 37.44
+        suite.longitude = -122.14
+        XCTAssertTrue(HomeGapLogic.isSamePlace(office, suite))
+        XCTAssertNil(
+            advice(first: office, second: suite, aToHome: 20, homeToB: 20, aToB: 5, buffer: 5, minHome: 30)
+        )
+    }
+
+    func testDifferentLocationsTightHomeIsDontGoHome() throws {
+        let dentist = stop("a", "Dentist", start: time(14), end: time(15), place: "Valencia")
+        let riding = stop("b", "Riding", start: time(15, 40), end: time(16, 40), place: "Westwind Community Barn")
+        XCTAssertFalse(HomeGapLogic.isSamePlace(dentist, riding))
+        let suggestion = try XCTUnwrap(
+            advice(first: dentist, second: riding, aToHome: 20, homeToB: 20, aToB: 10, buffer: 5)
+        )
+        XCTAssertEqual(suggestion.kind, .stayOut)
+        XCTAssertEqual(suggestion.collapsedHeadline, String(localized: "Don’t go home"))
+        let drafts = HomeGapNotifier.drafts(from: [suggestion], now: time(14, 20))
+        XCTAssertEqual(drafts.count, 1)
+        XCTAssertTrue(drafts[0].title.contains("Don’t go home"), drafts[0].title)
+    }
+
+    /// Live HomeGapRouter needs two resolved pins. Same pin / same address stays silent.
+    func testDontGoHomeOnlyWhenResolvedPinsAreDifferentPlaces() throws {
+        var clinic = stop(
+            "a",
+            "Dentist",
+            start: time(14),
+            end: time(15),
+            place: "11800 Willow Road, Menlo Park, CA"
+        )
+        clinic.latitude = 37.479
+        clinic.longitude = -122.155
+        var barn = stop(
+            "b",
+            "Riding",
+            start: time(15, 40),
+            end: time(16, 40),
+            place: "27210 Altamont Rd, Los Altos Hills, CA"
+        )
+        barn.latitude = 37.365
+        barn.longitude = -122.160
+
+        XCTAssertFalse(
+            HomeGapLogic.isSamePlace(clinic, barn),
+            "two different saved addresses must stay two places"
+        )
+        XCTAssertNotNil(HomeGapLogic.pin(for: clinic, home: nil))
+        XCTAssertNotNil(HomeGapLogic.pin(for: barn, home: nil))
+        let stayOut = try XCTUnwrap(
+            advice(first: clinic, second: barn, aToHome: 20, homeToB: 20, aToB: 12, buffer: 5)
+        )
+        XCTAssertEqual(stayOut.kind, .stayOut)
+        XCTAssertEqual(stayOut.collapsedHeadline, String(localized: "Don’t go home"))
+        XCTAssertTrue(stayOut.headline.contains("Don’t go home"), stayOut.headline)
+
+        var sameClinic = stop(
+            "c",
+            "Cleaning",
+            start: time(16),
+            end: time(17),
+            place: "Peninsula Family Health"
+        )
+        sameClinic.latitude = clinic.latitude
+        sameClinic.longitude = clinic.longitude
+        XCTAssertTrue(HomeGapLogic.isSamePlace(clinic, sameClinic))
+        XCTAssertNil(
+            advice(first: clinic, second: sameClinic, aToHome: 20, homeToB: 20, aToB: 5, buffer: 5),
+            "same resolved pin — Don’t go home is not the question"
+        )
+    }
+
     func testShortLeftoverStaysAtA() throws {
         // Leave A at 3:00. Direct 20 min, B at 3:30. Leftover 10 < 15.
         let classStop = stop("a", "Class", start: time(14), end: time(15))
@@ -225,6 +359,29 @@ final class ScedraHomeGapTests: XCTestCase {
         XCTAssertEqual(suggestion.collapsedSubtitle, "Dentist / Riding")
         XCTAssertEqual(suggestion.detail, "Dentist / Riding")
         XCTAssertFalse(suggestion.headline.contains("can’t be lived"))
+    }
+
+    func testOverlapDoesNotNeedPlacesOrDriveMinutes() throws {
+        let first = stop("a", "Chemistry", start: time(14), end: time(16))
+        let second = stop("b", "Dentist", start: time(15), end: time(17))
+        let suggestion = try XCTUnwrap(
+            HomeGapLogic.overlapSuggestion(first: first, second: second, calendar: cal)
+        )
+        XCTAssertEqual(suggestion.kind, .cannotBeLived)
+        XCTAssertEqual(suggestion.headline, String(localized: "These overlap"))
+        XCTAssertEqual(suggestion.collapsedHeadline, String(localized: "These overlap"))
+        XCTAssertEqual(suggestion.collapsedSubtitle, "Chemistry / Dentist")
+        let withoutMinutes = try XCTUnwrap(
+            advice(first: first, second: second, aToHome: nil, homeToB: nil, aToB: -1)
+        )
+        XCTAssertEqual(withoutMinutes.headline, String(localized: "These overlap"))
+        XCTAssertNil(
+            HomeGapLogic.overlapSuggestion(
+                first: first,
+                second: stop("c", "Riding", start: time(17), end: time(18)),
+                calendar: cal
+            )
+        )
     }
 
     func testOverlapCollapsedSubtitleKeepsBothRawTitles() throws {

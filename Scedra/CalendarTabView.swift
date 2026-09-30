@@ -30,7 +30,7 @@ enum CalendarDayPresentation: Equatable {
 }
 
 /// Don’t-go-home / Conflict / These overlap / Take transit for the selected day.
-/// Calendar pins these under the date header, outside the hour-grid ScrollView.
+/// Calendar draws these at the top of the same hour-grid ScrollView.
 enum CalendarDayHomeGap {
     static func stops(from items: [TodayItem]) -> [HomeGapStop] {
         items.filter { !$0.isAllDay }.map { $0.asHomeGapStop() }
@@ -38,6 +38,51 @@ enum CalendarDayHomeGap {
 
     static func shouldShowNotices(for items: [TodayItem]) -> Bool {
         !HomeGapLogic.consecutivePairs(from: stops(from: items)).isEmpty
+    }
+}
+
+/// Shared spacing / scroll target for calendar problem cards.
+enum CalendarNoticeChrome {
+    static let cardSpacing: CGFloat = 12
+    static let noticeAnchor = "scedra-day-notices"
+}
+
+/// Sticky label when the problem cards have left the hour-grid viewport.
+enum CalendarNoticeHint: Equatable {
+    case hidden
+    case scrollUp
+    case scrollDown
+
+    /// A sliver of card still on screen is enough — no separate peek strip.
+    static let minVisibleHeight: CGFloat = 12
+
+    var message: String {
+        switch self {
+        case .hidden:
+            ""
+        case .scrollUp:
+            ScedraString("Scroll up to see problems")
+        case .scrollDown:
+            ScedraString("Scroll down to see problems")
+        }
+    }
+
+    /// `noticeFrameInContent` and `visibleRect` share the scroll content space.
+    static func of(noticeFrameInContent: CGRect, visibleRect: CGRect) -> CalendarNoticeHint {
+        guard noticeFrameInContent.height > 1, visibleRect.height > 1 else {
+            return .hidden
+        }
+        let overlap = noticeFrameInContent.intersection(visibleRect).height
+        if overlap >= minVisibleHeight {
+            return .hidden
+        }
+        if noticeFrameInContent.maxY <= visibleRect.minY + minVisibleHeight {
+            return .scrollUp
+        }
+        if noticeFrameInContent.minY >= visibleRect.maxY - minVisibleHeight {
+            return .scrollDown
+        }
+        return noticeFrameInContent.midY < visibleRect.midY ? .scrollUp : .scrollDown
     }
 }
 
@@ -50,7 +95,7 @@ struct CalendarTabView: View {
 
     var body: some View {
         NavigationStack {
-            ZStack {
+            ZStack(alignment: .top) {
                 ScedraTheme.background.ignoresSafeArea()
 
                 VStack(alignment: .leading, spacing: 16) {
@@ -58,11 +103,9 @@ struct CalendarTabView: View {
                         showSettings = true
                     }
                     dayPicker
-                    if showsDayNotices {
-                        HomeGapSection(stops: CalendarDayHomeGap.stops(from: calendar.selectedDayEvents))
-                    }
-                    eventList
+                    dayContents
                 }
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
                 .padding(.horizontal, 20)
                 .padding(.top, 8)
             }
@@ -145,7 +188,7 @@ struct CalendarTabView: View {
         }
     }
 
-    /// Collapsed notices sit under the date — never inside the hour-grid scroll.
+    /// Problem cards ride the hour-grid scroll, starting above the hours.
     private var showsDayNotices: Bool {
         CalendarDayPresentation.of(
             access: calendar.access,
@@ -154,10 +197,18 @@ struct CalendarTabView: View {
             && CalendarDayHomeGap.shouldShowNotices(for: calendar.selectedDayEvents)
     }
 
+    private var dayContents: some View {
+        eventList
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+    }
+
     private var rows: some View {
         DayTimelineView(
             day: calendar.selectedDay,
             items: calendar.selectedDayEvents,
+            noticeStops: showsDayNotices
+                ? CalendarDayHomeGap.stops(from: calendar.selectedDayEvents)
+                : [],
             onSelect: { selectedAppointment = SelectedAppointment(item: $0) },
             onDelete: { pendingDelete = $0 },
             onShiftDay: { calendar.shiftSelectedDay(by: $0) }

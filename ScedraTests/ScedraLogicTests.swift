@@ -1485,6 +1485,44 @@ final class ScedraLogicTests: XCTestCase {
         XCTAssertFalse(LocationProvider.isUsableFix(wildAccuracy))
     }
 
+    func testLastKnownSearchFixSurvivesWithoutLiveGPS() {
+        let suite = "scedra.location.test.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+
+        let fix = CLLocation(
+            coordinate: CLLocationCoordinate2D(latitude: 37.4419, longitude: -122.1430),
+            altitude: 0,
+            horizontalAccuracy: 10,
+            verticalAccuracy: 10,
+            timestamp: Date()
+        )
+        LocationProvider.persistLastKnown(fix, defaults: defaults)
+        let read = LocationProvider.persistedLastKnown(defaults: defaults)
+        XCTAssertEqual(read?.coordinate.latitude ?? 0, 37.4419, accuracy: 0.0001)
+        XCTAssertEqual(read?.coordinate.longitude ?? 0, -122.1430, accuracy: 0.0001)
+        XCTAssertTrue(LocationProvider.hasSearchableCoordinate(fix))
+
+        let stale = CLLocation(
+            coordinate: fix.coordinate,
+            altitude: 0,
+            horizontalAccuracy: 10,
+            verticalAccuracy: 10,
+            timestamp: Date().addingTimeInterval(-8 * 24 * 3600)
+        )
+        LocationProvider.persistLastKnown(stale, defaults: defaults)
+        XCTAssertNil(LocationProvider.persistedLastKnown(defaults: defaults), "week-old pins are not a search region")
+
+        let origin = CLLocation(
+            coordinate: CLLocationCoordinate2D(latitude: 0, longitude: 0),
+            altitude: 0,
+            horizontalAccuracy: 10,
+            verticalAccuracy: 10,
+            timestamp: Date()
+        )
+        XCTAssertFalse(LocationProvider.hasSearchableCoordinate(origin))
+    }
+
     func testNotesBlockStatesRealAppointmentTimeThenDriveThenPlace() {
         let calendar = Calendar.current
         let start = calendar.date(bySettingHour: 18, minute: 0, second: 0, of: Date())!

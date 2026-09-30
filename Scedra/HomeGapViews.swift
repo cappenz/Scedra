@@ -1,7 +1,7 @@
 import SwiftUI
 
-/// Collapsed title + optional subtitle. Lives in the page scroll —
-/// never sticky, never a nested scroll of its own.
+/// Collapsed one-line title + optional two-line subtitle. Calendar stacks
+/// these above the hour grid in the same ScrollView.
 struct CollapsibleNoticeCard<Detail: View>: View {
     let headline: String
     var subtitle: String? = nil
@@ -21,12 +21,12 @@ struct CollapsibleNoticeCard<Detail: View>: View {
                         Text(headline)
                             .font(.body.weight(.semibold))
                             .foregroundStyle(accent)
-                            .fixedSize(horizontal: false, vertical: true)
+                            .lineLimit(1)
                         if let subtitle, !subtitle.isEmpty {
                             Text(subtitle)
                                 .font(.subheadline)
                                 .foregroundStyle(accent)
-                                .fixedSize(horizontal: false, vertical: true)
+                                .lineLimit(2)
                         }
                     }
                     .frame(maxWidth: .infinity, alignment: .leading)
@@ -246,7 +246,14 @@ struct HomeGapSection: View {
     @State private var resolver = PlaceResolver()
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
+        cardStack
+            .task(id: signature) {
+                await refresh()
+            }
+    }
+
+    private var cardStack: some View {
+        VStack(alignment: .leading, spacing: CalendarNoticeChrome.cardSpacing) {
             if loading, suggestions.isEmpty, hasPairs {
                 HStack(spacing: 8) {
                     ProgressView()
@@ -259,9 +266,6 @@ struct HomeGapSection: View {
             ForEach(visibleSuggestions) { suggestion in
                 HomeGapCard(suggestion: suggestion)
             }
-        }
-        .task(id: signature) {
-            await refresh()
         }
     }
 
@@ -296,11 +300,15 @@ struct HomeGapSection: View {
             loading = false
             return
         }
-        loading = true
+        let standing = UserProfile.standingItems(from: standingBring)
+        let overlaps = relevant.compactMap { first, second in
+            HomeGapLogic.overlapSuggestion(first: first, second: second, standingBring: standing)
+        }
+        suggestions = overlaps
+        loading = overlaps.isEmpty
         let home = await resolver.geocodedHomeLocation()
-        let resolved = await resolveMissingPins(stops)
         let next = await HomeGapRouter.suggestions(
-            stops: resolved,
+            stops: stops,
             home: home,
             leavingHomeBuffer: homeGap,
             walkMinutes: walkMinutes,
@@ -312,26 +320,5 @@ struct HomeGapSection: View {
         guard !Task.isCancelled else { return }
         suggestions = next
         loading = false
-    }
-
-    /// Memory first, then a place search. Never invents a pin.
-    private func resolveMissingPins(_ stops: [HomeGapStop]) async -> [HomeGapStop] {
-        var seen: [String: HomeGapStop] = [:]
-        var ordered: [HomeGapStop] = []
-        for stop in stops {
-            if seen[stop.id] != nil { continue }
-            var next = HomeGapLogic.enrichFromMemory(stop)
-            if HomeGapLogic.pin(for: next, home: nil) == nil,
-               !next.usesHome {
-                let query = next.place.trimmingCharacters(in: .whitespacesAndNewlines)
-                if !query.isEmpty, let place = await resolver.resolve(query) {
-                    next.latitude = place.latitude
-                    next.longitude = place.longitude
-                }
-            }
-            seen[next.id] = next
-            ordered.append(next)
-        }
-        return ordered
     }
 }

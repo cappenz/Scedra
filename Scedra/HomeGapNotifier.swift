@@ -45,7 +45,8 @@ enum HomeGapNotifier {
 
     static func drafts(from suggestions: [HomeGapSuggestion], now: Date = Date()) -> [HomeGapNotificationDraft] {
         suggestions.compactMap { suggestion in
-            guard suggestion.kind != .cannotBeLived, suggestion.kind != .goHome else { return nil }
+            // Stay-out / transit only. Going home is assumed; overlap cards stay on screen.
+            guard suggestion.kind == .stayOut || suggestion.kind == .takeTransit else { return nil }
             guard suggestion.notifyAt > now else { return nil }
             return HomeGapNotificationDraft(
                 identifier: idPrefix + suggestion.id,

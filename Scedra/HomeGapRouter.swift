@@ -15,6 +15,14 @@ enum HomeGapRouter {
         minHomeMinutes: Int = 0,
         standingBring: [String] = []
     ) async -> HomeGapSuggestion? {
+        if let overlap = HomeGapLogic.overlapSuggestion(
+            first: first,
+            second: second,
+            standingBring: standingBring
+        ) {
+            return overlap
+        }
+
         var first = await enrich(first)
         var second = await enrich(second)
         guard let fromA = HomeGapLogic.pin(for: first, home: home),
@@ -92,20 +100,38 @@ enum HomeGapRouter {
         return suggestion
     }
 
-    private static func enrich(_ stop: HomeGapStop) async -> HomeGapStop {
+    /// Memory, then a real place search. Stay-out needs pins for two different places.
+    static func resolvePins(
+        _ stops: [HomeGapStop],
+        using resolver: PlaceResolver = PlaceResolver()
+    ) async -> [HomeGapStop] {
+        var seen: [String: HomeGapStop] = [:]
+        var ordered: [HomeGapStop] = []
+        for stop in stops {
+            if seen[stop.id] != nil { continue }
+            let next = await enrich(stop, resolver: resolver)
+            seen[next.id] = next
+            ordered.append(next)
+        }
+        return ordered
+    }
+
+    private static func enrich(
+        _ stop: HomeGapStop,
+        resolver: PlaceResolver = PlaceResolver()
+    ) async -> HomeGapStop {
         var stop = HomeGapLogic.enrichFromMemory(stop)
         if stop.coordinate != nil { return stop }
-        let query = stop.place.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-            ? stop.title
-            : stop.place
-        guard let location = await PlaceResolver().geocodedSavedPlace(matching: query) else {
+        if stop.usesHome || HomeGapLogic.looksLikeHome(stop.place) { return stop }
+        let query = stop.place.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !query.isEmpty, let place = await resolver.resolve(query) else {
             return stop
         }
-        stop.latitude = location.coordinate.latitude
-        stop.longitude = location.coordinate.longitude
-        if stop.place.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-           let saved = ProfileDetailsStore.place(matching: query) {
-            stop.place = saved.address
+        stop.latitude = place.latitude
+        stop.longitude = place.longitude
+        if stop.place.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            let address = place.address.trimmingCharacters(in: .whitespacesAndNewlines)
+            stop.place = address.isEmpty ? place.name : address
         }
         return stop
     }
@@ -120,8 +146,9 @@ enum HomeGapRouter {
         standingBring: [String] = [],
         involving ids: Set<String> = []
     ) async -> [HomeGapSuggestion] {
+        let resolved = await resolvePins(stops)
         var result: [HomeGapSuggestion] = []
-        for (first, second) in HomeGapLogic.consecutivePairs(from: stops) {
+        for (first, second) in HomeGapLogic.consecutivePairs(from: resolved) {
             if !ids.isEmpty, !ids.contains(first.id), !ids.contains(second.id) {
                 continue
             }
@@ -218,8 +245,6 @@ enum HomeGapRouter {
         _ lhs: CLLocationCoordinate2D,
         _ rhs: CLLocationCoordinate2D
     ) -> Bool {
-        let left = CLLocation(latitude: lhs.latitude, longitude: lhs.longitude)
-        let right = CLLocation(latitude: rhs.latitude, longitude: rhs.longitude)
-        return left.distance(from: right) < 80
+        HomeGapLogic.pinsAreSamePlace(lhs, rhs)
     }
 }

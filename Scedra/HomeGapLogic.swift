@@ -122,6 +122,34 @@ enum HomeGapLogic {
     static let shortLeftoverMinutes = 15
     /// How far before A ends we remind her of the plan.
     static let notifyLeadMinutes = 15
+    /// Same saved pin / address — close enough that going home is not the question.
+    static let samePlaceMeters: CLLocationDistance = 80
+
+    /// Two timed events on the same clock. Places and drive minutes are irrelevant.
+    static func overlapSuggestion(
+        first: HomeGapStop,
+        second: HomeGapStop,
+        standingBring: [String] = [],
+        calendar: Calendar = .current
+    ) -> HomeGapSuggestion? {
+        guard calendar.isDate(first.officialStart, inSameDayAs: second.officialStart) else { return nil }
+        guard ConflictLogic.overlaps(
+            start: first.officialStart,
+            end: first.officialEnd,
+            otherStart: second.officialStart,
+            otherEnd: second.officialEnd
+        ) else { return nil }
+        return make(
+            first: first,
+            second: second,
+            kind: .cannotBeLived,
+            headline: ScedraString("These overlap"),
+            detail: HomeGapSuggestion.pairLine(first.title, second.title),
+            bring: WhatToBring.pack(for: second, kind: .cannotBeLived, standing: standingBring),
+            walkingNote: nil,
+            transitNote: nil
+        )
+    }
 
     static func consecutivePairs(
         from stops: [HomeGapStop],
@@ -154,26 +182,15 @@ enum HomeGapLogic {
         standingBring: [String] = [],
         calendar: Calendar = .current
     ) -> HomeGapSuggestion? {
-        guard calendar.isDate(first.officialStart, inSameDayAs: second.officialStart) else { return nil }
-        guard minutes.aToB >= 0 else { return nil }
-
-        if ConflictLogic.overlaps(
-            start: first.officialStart,
-            end: first.officialEnd,
-            otherStart: second.officialStart,
-            otherEnd: second.officialEnd
+        if let overlap = overlapSuggestion(
+            first: first,
+            second: second,
+            standingBring: standingBring,
+            calendar: calendar
         ) {
-            return make(
-                first: first,
-                second: second,
-                kind: .cannotBeLived,
-                headline: ScedraString("These overlap"),
-                detail: HomeGapSuggestion.pairLine(first.title, second.title),
-                bring: WhatToBring.pack(for: second, kind: .cannotBeLived, standing: standingBring),
-                walkingNote: nil,
-                transitNote: nil
-            )
+            return overlap
         }
+        guard minutes.aToB >= 0 else { return nil }
 
         let leaveA = first.leaveAt
         let gap = Int(second.officialStart.timeIntervalSince(leaveA) / 60)
@@ -213,6 +230,11 @@ enum HomeGapLogic {
                 walkingNote: walkingNote(aToB: minutes.aToB, walkMinutes: walkMinutes),
                 transitNote: transit
             )
+        }
+
+        // Same office / same pin: she can stay there. Don’t-go-home is only for two places.
+        if isSamePlace(first, second) {
+            return nil
         }
 
         if let aToHome = minutes.aToHome, let homeToB = minutes.homeToB {
@@ -380,6 +402,42 @@ enum HomeGapLogic {
             return transitNote(drive: minutes.aToB, transit: minutes.aToBTransit, preferTransit: preferTransit)
         }
         return ScedraString("Transit home and back ~\(home + out) min.")
+    }
+
+    /// Same address, both Home, or pins within `samePlaceMeters`.
+    static func isSamePlace(
+        _ first: HomeGapStop,
+        _ second: HomeGapStop,
+        home: CLLocation? = nil
+    ) -> Bool {
+        let firstHome = first.usesHome || looksLikeHome(first.place)
+        let secondHome = second.usesHome || looksLikeHome(second.place)
+        if firstHome && secondHome { return true }
+
+        let leftName = normalizedPlace(first.place)
+        let rightName = normalizedPlace(second.place)
+        if !leftName.isEmpty, leftName == rightName { return true }
+
+        guard let left = pin(for: first, home: home),
+              let right = pin(for: second, home: home)
+        else { return false }
+        return pinsAreSamePlace(left, right)
+    }
+
+    static func pinsAreSamePlace(
+        _ lhs: CLLocationCoordinate2D,
+        _ rhs: CLLocationCoordinate2D
+    ) -> Bool {
+        let left = CLLocation(latitude: lhs.latitude, longitude: lhs.longitude)
+        let right = CLLocation(latitude: rhs.latitude, longitude: rhs.longitude)
+        return left.distance(from: right) < samePlaceMeters
+    }
+
+    static func normalizedPlace(_ place: String) -> String {
+        place
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+            .replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
     }
 
     static func pin(

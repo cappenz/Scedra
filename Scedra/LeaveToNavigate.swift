@@ -254,6 +254,11 @@ enum LeaveToNavigatePlanner {
            let longitude = saved.longitude {
             return CLLocationCoordinate2D(latitude: latitude, longitude: longitude)
         }
+        if let place = await resolver.resolve(query),
+           let latitude = place.latitude,
+           let longitude = place.longitude {
+            return CLLocationCoordinate2D(latitude: latitude, longitude: longitude)
+        }
         return nil
     }
 

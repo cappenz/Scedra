@@ -390,4 +390,44 @@ final class ScedraPlaceTests: XCTestCase {
         XCTAssertEqual(parsed.title, "dentist")
         XCTAssertEqual(parsed.place, "dentist")
     }
+
+    func testAddressLookupPrefersTheStreetAfterTheDot() {
+        XCTAssertEqual(
+            PlaceResolver.addressLookupCandidates(from: "McDonald's · 165 University Ave"),
+            ["165 University Ave", "McDonald's · 165 University Ave", "McDonald's"]
+        )
+        XCTAssertEqual(
+            PlaceResolver.addressLookupCandidates(from: "1 Apple Park Way, Cupertino, CA"),
+            ["1 Apple Park Way, Cupertino, CA"]
+        )
+        XCTAssertTrue(PlaceResolver.isSpecificAddress("1 Apple Park Way, Cupertino, CA"))
+        XCTAssertTrue(PlaceResolver.isSpecificAddress("McDonald's · 165 University Ave"))
+    }
+
+    func testSearchHintNeverLeavesLocalSearchWithoutARegionCenter() {
+        let home = CLLocation(latitude: 37.4419, longitude: -122.1430)
+        let last = CLLocation(latitude: 37.3349, longitude: -122.0090)
+        XCTAssertEqual(
+            PlaceResolver.searchHint(home: home, lastKnown: last).coordinate.latitude,
+            home.coordinate.latitude,
+            accuracy: 0.0001,
+            "Home wins over last-known for a search region"
+        )
+        XCTAssertEqual(
+            PlaceResolver.searchHint(home: nil, lastKnown: last).coordinate.latitude,
+            last.coordinate.latitude,
+            accuracy: 0.0001
+        )
+        let fallback = PlaceResolver.searchHint(home: nil, lastKnown: nil)
+        XCTAssertTrue(CLLocationCoordinate2DIsValid(fallback.coordinate))
+        XCTAssertTrue(PlaceResolver.isFallbackSearchLocation(fallback))
+        XCTAssertFalse(PlaceResolver.isFallbackSearchLocation(home))
+
+        let region = PlaceResolver.localSearchRegion(
+            around: fallback,
+            radius: PlaceResolver.fallbackSearchRadiusMeters
+        )
+        XCTAssertGreaterThan(region.span.latitudeDelta, 0)
+        XCTAssertGreaterThan(region.span.longitudeDelta, 0)
+    }
 }

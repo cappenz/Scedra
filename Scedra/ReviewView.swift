@@ -868,10 +868,9 @@ struct ReviewView: View {
         guard let latitude = draft.locationLatitude, let longitude = draft.locationLongitude else {
             // Keep the loading line until lookup finishes — don't flash "couldn't pin"
             // while MapKit is still working, or if this task raced ahead of resolve.
+            let hasPlace = !draft.location.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             let lookupStillOpen = isResolvingLocation
-                || (draft.resolvedLocation == nil
-                    && locationNote == nil
-                    && !PlaceResolver.isSpecificAddress(draft.location))
+                || (draft.resolvedLocation == nil && locationNote == nil && hasPlace)
             travel = lookupStillOpen
                 ? .estimating
                 : .unavailable(TravelEstimator.noPinMessage)
@@ -954,11 +953,6 @@ struct ReviewView: View {
             drafts[index].clearResolvedPlace()
             locationNote = nil
             isResolvingLocation = false
-            return
-        }
-        if PlaceResolver.isSpecificAddress(query) {
-            isResolvingLocation = false
-            locationNote = nil
             return
         }
 

@@ -511,6 +511,69 @@ final class ScedraTimelineTests: XCTestCase {
         XCTAssertEqual(CalendarDayHomeGap.stops(from: [dentist, riding]).count, 2)
     }
 
+    func testOverlappingEventsWithoutPlacesStillShowTheseOverlapOnCalendar() throws {
+        let chemistry = calendarItem("a", "Chemistry", start: time(14), end: time(16))
+        let dentist = calendarItem("b", "Dentist", start: time(15), end: time(17))
+        XCTAssertTrue(CalendarDayHomeGap.shouldShowNotices(for: [chemistry, dentist]))
+        let stops = CalendarDayHomeGap.stops(from: [chemistry, dentist])
+        XCTAssertEqual(stops.count, 2)
+        let overlap = try XCTUnwrap(HomeGapLogic.overlapSuggestion(first: stops[0], second: stops[1]))
+        XCTAssertEqual(overlap.collapsedHeadline, String(localized: "These overlap"))
+        XCTAssertEqual(overlap.collapsedSubtitle, "Chemistry / Dentist")
+        XCTAssertNotEqual(overlap.kind, .goHome)
+    }
+
+    func testNoticeHintStaysHiddenWhileCardsIntersectTheViewport() {
+        let cards = CGRect(x: 0, y: 0, width: 320, height: 80)
+        let visible = CGRect(x: 0, y: 0, width: 320, height: 500)
+        XCTAssertEqual(CalendarNoticeHint.of(noticeFrameInContent: cards, visibleRect: visible), .hidden)
+    }
+
+    func testNoticeHintSaysScrollUpWhenCardsHaveLeftTheTop() {
+        let cards = CGRect(x: 0, y: 0, width: 320, height: 80)
+        let visible = CGRect(x: 0, y: 200, width: 320, height: 500)
+        XCTAssertEqual(CalendarNoticeHint.of(noticeFrameInContent: cards, visibleRect: visible), .scrollUp)
+        XCTAssertEqual(
+            CalendarNoticeHint.scrollUp.message,
+            ScedraString("Scroll up to see problems")
+        )
+    }
+
+    func testNoticeHintSaysScrollDownWhenCardsSitBelowTheViewport() {
+        let cards = CGRect(x: 0, y: 600, width: 320, height: 80)
+        let visible = CGRect(x: 0, y: 0, width: 320, height: 500)
+        XCTAssertEqual(CalendarNoticeHint.of(noticeFrameInContent: cards, visibleRect: visible), .scrollDown)
+        XCTAssertEqual(
+            CalendarNoticeHint.scrollDown.message,
+            ScedraString("Scroll down to see problems")
+        )
+    }
+
+    func testNoticeHintHiddenWhenTheCardStackHasNoHeight() {
+        let empty = CGRect(x: 0, y: -40, width: 320, height: 0)
+        let visible = CGRect(x: 0, y: 0, width: 320, height: 500)
+        XCTAssertEqual(CalendarNoticeHint.of(noticeFrameInContent: empty, visibleRect: visible), .hidden)
+    }
+
+    func testNoticeHintCopyIsTranslated() {
+        XCTAssertEqual(
+            ScedraString("Scroll up to see problems", locale: Locale(identifier: "de")),
+            "Nach oben zu den Problemen"
+        )
+        XCTAssertEqual(
+            ScedraString("Scroll down to see problems", locale: Locale(identifier: "fr")),
+            "Descendre vers les problèmes"
+        )
+        XCTAssertEqual(
+            ScedraString("Scroll up to see problems", locale: Locale(identifier: "es")),
+            "Sube para ver los problemas"
+        )
+        XCTAssertEqual(
+            ScedraString("Scroll down to see problems", locale: Locale(identifier: "en")),
+            "Scroll down to see problems"
+        )
+    }
+
     func testAllDayOrSingleEventDoesNotReserveACalendarHomeGapSlot() {
         let allDay = calendarItem("all", "Holiday", start: dayStart, end: time(23, 59), allDay: true)
         let only = calendarItem("one", "Dentist", start: time(14), end: time(15), place: "Valencia")

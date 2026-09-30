@@ -9,6 +9,11 @@ final class LocationProvider: NSObject, CLLocationManagerDelegate {
     static let maxAgeSeconds: TimeInterval = 180
     /// Negative accuracy is invalid. Past a kilometer is not a usable driving origin.
     static let maxHorizontalAccuracy: CLLocationAccuracy = 1_000
+    /// Search can reuse a pin from earlier today / this week when GPS is off.
+    static let searchFixMaxAgeSeconds: TimeInterval = 7 * 24 * 60 * 60
+    static let lastKnownLatitudeKey = "scedra.lastKnownLatitude"
+    static let lastKnownLongitudeKey = "scedra.lastKnownLongitude"
+    static let lastKnownTimestampKey = "scedra.lastKnownTimestamp"
 
     private let manager = CLLocationManager()
     private var authorizationWaiter: CheckedContinuation<CLAuthorizationStatus, Never>?
@@ -26,17 +31,69 @@ final class LocationProvider: NSObject, CLLocationManagerDelegate {
     /// Recent, authorized, accuracy-sane fix. Nil if denied, unset in Simulator, or garbage.
     func currentFix() async -> CLLocation? {
         if let cached, Self.isUsableFix(cached.location) {
+            remember(cached.location)
             return cached.location
         }
         guard await ensureAuthorized() else { return nil }
         if let last = manager.location, Self.isUsableFix(last) {
-            cached = (last, Date())
+            remember(last)
             return last
         }
         let location = await requestUpdatingLocation()
         guard let location, Self.isUsableFix(location) else { return nil }
-        cached = (location, Date())
+        remember(location)
         return location
+    }
+
+    /// Last GPS pin we can use as an MKLocalSearch region. Does not request
+    /// permission or wait for a fresh fix — nil is fine; the resolver has Home
+    /// and a default region after this.
+    func lastKnownForSearch() -> CLLocation? {
+        if let cached, Self.hasSearchableCoordinate(cached.location) {
+            return cached.location
+        }
+        if let last = manager.location, Self.hasSearchableCoordinate(last) {
+            return last
+        }
+        return Self.persistedLastKnown()
+    }
+
+    static func persistLastKnown(_ location: CLLocation, defaults: UserDefaults = .standard) {
+        guard hasSearchableCoordinate(location) else { return }
+        defaults.set(location.coordinate.latitude, forKey: lastKnownLatitudeKey)
+        defaults.set(location.coordinate.longitude, forKey: lastKnownLongitudeKey)
+        defaults.set(location.timestamp.timeIntervalSince1970, forKey: lastKnownTimestampKey)
+    }
+
+    static func persistedLastKnown(
+        now: Date = Date(),
+        defaults: UserDefaults = .standard
+    ) -> CLLocation? {
+        guard defaults.object(forKey: lastKnownLatitudeKey) != nil,
+              defaults.object(forKey: lastKnownLongitudeKey) != nil
+        else { return nil }
+        let latitude = defaults.double(forKey: lastKnownLatitudeKey)
+        let longitude = defaults.double(forKey: lastKnownLongitudeKey)
+        let timestamp = Date(timeIntervalSince1970: defaults.double(forKey: lastKnownTimestampKey))
+        let location = CLLocation(
+            coordinate: CLLocationCoordinate2D(latitude: latitude, longitude: longitude),
+            altitude: 0,
+            horizontalAccuracy: 100,
+            verticalAccuracy: -1,
+            timestamp: timestamp
+        )
+        guard hasSearchableCoordinate(location),
+              now.timeIntervalSince(timestamp) <= searchFixMaxAgeSeconds
+        else { return nil }
+        return location
+    }
+
+    static func hasSearchableCoordinate(_ location: CLLocation) -> Bool {
+        guard CLLocationCoordinate2DIsValid(location.coordinate) else { return false }
+        guard abs(location.coordinate.latitude) > 0.01
+            || abs(location.coordinate.longitude) > 0.01
+        else { return false }
+        return location.horizontalAccuracy >= 0
     }
 
     /// A Core Location fix we will actually route from. Coordinates are not filtered by city.
@@ -47,6 +104,11 @@ final class LocationProvider: NSObject, CLLocationManagerDelegate {
             return false
         }
         return now.timeIntervalSince(location.timestamp) <= maxAgeSeconds
+    }
+
+    private func remember(_ location: CLLocation) {
+        cached = (location, Date())
+        Self.persistLastKnown(location)
     }
 
     private func ensureAuthorized() async -> Bool {
