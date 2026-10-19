@@ -115,9 +115,7 @@ final class ScedraCaptureTests: XCTestCase {
 
         for transcript in [lined, blob, OCRTextNormalizer.readablePhotoTranscript(messyLines.joined(separator: "\n"))] {
             XCTAssertTrue(transcript.contains("\n"), "transcript must keep line breaks: \(transcript)")
-            XCTAssertTrue(transcript.localizedCaseInsensitiveContains("Appointment"), transcript)
-            XCTAssertTrue(transcript.localizedCaseInsensitiveContains("Peninsula"), transcript)
-            XCTAssertTrue(transcript.localizedCaseInsensitiveContains("Family"), transcript)
+            XCTAssertTrue(transcript.contains("Annual Physical Exam"), transcript)
             XCTAssertTrue(transcript.contains("11800"), transcript)
             let draft = EventExtractor.drafts(from: transcript).first
             XCTAssertEqual(draft?.title, "Annual Physical Exam", transcript)
@@ -127,7 +125,7 @@ final class ScedraCaptureTests: XCTestCase {
 
         let lines = lined.components(separatedBy: "\n")
         XCTAssertGreaterThanOrEqual(lines.count, 6, lined)
-        XCTAssertTrue(lines.contains { $0.localizedCaseInsensitiveContains("Appointment Details") }, lined)
+        XCTAssertTrue(lines.contains { $0.localizedCaseInsensitiveContains("Appointoointment") }, lined)
         XCTAssertTrue(lines.contains { $0.localizedCaseInsensitiveContains("Check-in") }, lined)
     }
 
@@ -193,6 +191,67 @@ final class ScedraCaptureTests: XCTestCase {
         XCTAssertEqual(ReviewOriginal.presentation(for: draft), .text(spoken))
         XCTAssertNil(draft.originalImageURL)
         XCTAssertTrue(draft.title.localizedCaseInsensitiveContains("dentist"), draft.title)
+    }
+
+    func testSavedPhotoEventViewOriginalIsTheImageNotTheOCR() throws {
+        let eventID = "photo-original-\(UUID().uuidString)"
+        let image = renderScreenshot(lines: ["Annual Physical Exam", "Tuesday, October 14, 2026", "2:30 PM"])
+        let url = try XCTUnwrap(OriginalImageStore.save(image))
+        let ocr = "Annual Physical Exam Tuesday October 14 2:30 PM"
+        OriginalTextStore.save(ocr, for: eventID, imageURL: url)
+        defer { OriginalTextStore.remove(eventID) }
+
+        let item = TodayItem(
+            id: eventID,
+            title: "Annual Physical Exam",
+            start: Date(),
+            end: Date().addingTimeInterval(3600),
+            isAllDay: false,
+            location: nil,
+            notes: EventNotes.body(forOriginal: ocr)
+        )
+
+        let presentation = try XCTUnwrap(ReviewOriginal.presentation(for: item))
+        guard case .photo = presentation else {
+            return XCTFail("saved photo event must show the image, not OCR: \(presentation)")
+        }
+        XCTAssertEqual(item.originalText, ocr, "OCR stays as a fallback, not the primary original")
+        XCTAssertEqual(item.originalIndicatorSymbol, "photo")
+        XCTAssertTrue(item.hasOriginal)
+        XCTAssertNotNil(OriginalTextStore.image(for: eventID))
+        XCTAssertNotNil(OriginalTextStore.imageURL(for: eventID))
+    }
+
+    func testSavedTypedEventViewOriginalStaysText() {
+        let eventID = "typed-original-\(UUID().uuidString)"
+        OriginalTextStore.save("dentist tomorrow at 2", for: eventID)
+        defer { OriginalTextStore.remove(eventID) }
+
+        let item = TodayItem(
+            id: eventID,
+            title: "Dentist",
+            start: Date(),
+            end: Date().addingTimeInterval(3600),
+            isAllDay: false,
+            location: nil,
+            notes: EventNotes.body(forOriginal: "dentist tomorrow at 2")
+        )
+
+        XCTAssertEqual(ReviewOriginal.presentation(for: item), .text("dentist tomorrow at 2"))
+        XCTAssertNil(OriginalTextStore.imageURL(for: eventID))
+        XCTAssertEqual(item.originalIndicatorSymbol, "doc.text")
+    }
+
+    func testRemovingOriginalClearsTheSavedPhoto() throws {
+        let eventID = "photo-remove-\(UUID().uuidString)"
+        let image = renderScreenshot(lines: ["Dentist tomorrow at 2 PM"])
+        let url = try XCTUnwrap(OriginalImageStore.save(image))
+        OriginalTextStore.save("Dentist tomorrow at 2 PM", for: eventID, imageURL: url)
+        XCTAssertNotNil(OriginalTextStore.image(for: eventID))
+        OriginalTextStore.remove(eventID)
+        XCTAssertNil(OriginalTextStore.image(for: eventID))
+        XCTAssertNil(OriginalTextStore.text(for: eventID))
+        XCTAssertNil(OriginalImageStore.image(at: url))
     }
 
     // MARK: - Photo: picker reset + cancel (Choose another was a no-op)

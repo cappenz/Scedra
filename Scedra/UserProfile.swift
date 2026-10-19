@@ -73,6 +73,9 @@ enum UserProfile {
     static let workOutKey = "scedra.workOutGapMinutes"
     static let travelModeKey = "scedra.travelMode"
     static let walkMinutesKey = "scedra.walkMinutes"
+    static let searchFromKey = "scedra.searchFrom"
+    /// New Scedra events: drive sits inside the appointment, or as its own EventKit event.
+    static let driveTimePlacementKey = "scedra.driveTimePlacement"
     /// Standing “remind me to bring” list — one item per line or comma-separated.
     static let standingBringKey = "scedra.standingBring"
     /// Unset leaving-home buffer. Existing users who already stored 10 keep 10.
@@ -104,5 +107,25 @@ enum UserProfile {
     static var greeting: String {
         let name = displayName
         return name.isEmpty ? ScedraString("Hi") : ScedraString("Hi, \(name)")
+    }
+}
+
+/// Place search and “from here” travel origin. Named-area queries still win.
+enum PlaceSearchFrom: String, CaseIterable, Identifiable {
+    case currentLocation
+    case home
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .currentLocation: ScedraString("Current location")
+        case .home: ScedraString("Home")
+        }
+    }
+
+    static func resolved(defaults: UserDefaults = .standard) -> PlaceSearchFrom {
+        PlaceSearchFrom(rawValue: defaults.string(forKey: UserProfile.searchFromKey) ?? "")
+            ?? .currentLocation
     }
 }

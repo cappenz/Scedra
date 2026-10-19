@@ -61,6 +61,8 @@ final class MemoryTaskStore: TaskStore {
 final class TaskRepository {
     private let store: any TaskStore
     private(set) var tasks: [ScedraTask]
+    /// Fired after `placeAndSave` persists. Onboarding observes this only.
+    var placedTaskHandler: (() -> Void)?
 
     init(store: any TaskStore = UserDefaultsTaskStore()) {
         self.store = store
@@ -71,7 +73,7 @@ final class TaskRepository {
     var openTasks: [ScedraTask] {
         tasks
             .filter { !$0.isCompleted }
-            .sorted(by: Self.openOrder)
+            .sorted(by: TaskPriority.compare)
     }
 
     var completedTasks: [ScedraTask] {
@@ -107,6 +109,7 @@ final class TaskRepository {
 
     /// Places an open task, writes the EventKit block, then persists.
     /// `honorSchedule` keeps times she picked in the editor — no auto-move, no 3am invent.
+    /// Important tasks may bump a less-important Scedra task; calendar events never move.
     func placeAndSave(
         _ task: ScedraTask,
         writer: any TaskCalendarWriter,
@@ -116,6 +119,16 @@ final class TaskRepository {
         honorSchedule: Bool = false
     ) async {
         var next = task
+        next.title = next.title.trimmingCharacters(in: .whitespacesAndNewlines)
+        next.notes = next.notes.trimmingCharacters(in: .whitespacesAndNewlines)
+        next.location = next.location.trimmingCharacters(in: .whitespacesAndNewlines)
+        next.category = next.category.trimmingCharacters(in: .whitespacesAndNewlines)
+        next.updatedAt = Date()
+        if next.isCompleted {
+            next.completedAt = next.completedAt ?? Date()
+        } else {
+            next.completedAt = nil
+        }
         if honorSchedule, next.isPlaced, let start = next.scheduledStart {
             if TaskPlacement.manualSlotFits(next, start: start, busy: busy) {
                 next.applyPlacement(start: start)
@@ -128,43 +141,43 @@ final class TaskRepository {
             } else {
                 next.clearPlacementTimes()
             }
-        } else {
-            next = TaskPlacement.refreshed(task, busy: busy, now: now, scheduler: scheduler)
         }
         next.applyAutomaticCompletion(at: now)
-        let previousEventID = next.calendarEventIdentifier
+
+        var working = tasks
+        if let index = working.firstIndex(where: { $0.id == next.id }) {
+            working[index] = next
+        } else {
+            working.append(next)
+        }
+
         if next.isCompleted {
-            upsert(next)
-            reconcile(now: now)
+            tasks = working
+            persist()
+            placedTaskHandler?()
+            await pruneCompleted(writer: writer, now: now)
             return
         }
 
-        if !next.isPlaced {
-            next.calendarEventIdentifier = nil
-        }
-        upsert(next)
-
-        if let start = next.scheduledStart, let end = next.scheduledEnd {
-            do {
-                let identifier = try await writer.upsertTaskEvent(
-                    existingIdentifier: previousEventID,
-                    title: next.title,
-                    start: start,
-                    end: end,
-                    location: next.location,
-                    notes: next.notes
-                )
-                if let index = tasks.firstIndex(where: { $0.id == next.id }) {
-                    tasks[index].calendarEventIdentifier = identifier
-                    persist()
-                }
-            } catch {
-                // Keep the local slot. Identifier stays as the previous EventKit id if we had one.
-            }
-        } else if let previousEventID, !previousEventID.isEmpty {
-            try? await writer.deleteTaskEvent(identifier: previousEventID)
-        }
-        reconcile(now: now)
+        let previousIDs = Dictionary(
+            uniqueKeysWithValues: working.map { ($0.id, $0.calendarEventIdentifier) }
+        )
+        let calendarBusy = busy.filter { !$0.isTaskPlacement }
+        let open = working.filter { !$0.isCompleted }
+        let scheduled = TaskPlacement.schedulePrioritized(
+            open,
+            calendarBusy: calendarBusy,
+            now: now,
+            scheduler: scheduler,
+            honoring: honorSchedule ? next.id : nil
+        )
+        var byID = Dictionary(uniqueKeysWithValues: scheduled.map { ($0.id, $0) })
+        working = working.map { byID[$0.id] ?? $0 }
+        tasks = working
+        persist()
+        await syncPlacedEvents(scheduled, previousIDs: previousIDs, writer: writer)
+        await pruneCompleted(writer: writer, now: now)
+        placedTaskHandler?()
     }
 
     func placeAndSave(
@@ -215,6 +228,35 @@ final class TaskRepository {
         persist()
     }
 
+    /// The EventKit event for this task is gone (Calendar UI or Apple Calendar).
+    /// Drop the matching open or completed ScedraTask — never a regular appointment.
+    func removeMatchingCalendarEvents(_ identifiers: [String]) {
+        let ids = Set(
+            identifiers
+                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                .filter { !$0.isEmpty }
+        )
+        guard !ids.isEmpty else { return }
+        let before = tasks.count
+        tasks.removeAll { task in
+            let stored = task.calendarEventIdentifier?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            return !stored.isEmpty && ids.contains(stored)
+        }
+        guard tasks.count != before else { return }
+        persist()
+    }
+
+    /// Apple Calendar deletions that never went through Scedra's delete UI.
+    /// `eventExists` returning nil means we cannot tell — leave the task.
+    func removeTasksMissingFromCalendar(eventExists: (String) -> Bool?) {
+        let vanished = tasks.compactMap { task -> String? in
+            let stored = task.calendarEventIdentifier?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            guard !stored.isEmpty else { return nil }
+            return eventExists(stored) == false ? stored : nil
+        }
+        removeMatchingCalendarEvents(vanished)
+    }
+
     func delete(_ task: ScedraTask, from writer: any TaskCalendarWriter) async {
         if let identifier = task.calendarEventIdentifier, !identifier.isEmpty {
             try? await writer.deleteTaskEvent(identifier: identifier)
@@ -236,47 +278,38 @@ final class TaskRepository {
         now: Date
     ) -> [TaskBusyBlock] {
         let days = DefaultTaskAutoScheduler.dayCount(for: task, now: now)
-        let day0 = Calendar.current.startOfDay(for: now)
-        var items: [TodayItem] = []
-        for offset in 0..<days {
-            guard let day = Calendar.current.date(byAdding: .day, value: offset, to: day0) else { continue }
-            items.append(contentsOf: calendar.events(on: day))
-        }
-        if let identifier = task.calendarEventIdentifier, !identifier.isEmpty {
-            items.removeAll { $0.id == identifier }
-        }
-        var blocks = TaskAvailability.busyBlocks(from: items)
-        for other in tasks where other.id != task.id && !other.isCompleted {
-            if let start = other.scheduledStart, let end = other.scheduledEnd {
-                blocks.append(
-                    TaskBusyBlock(
-                        start: start,
-                        end: end,
-                        kind: .focusedWork,
-                        title: other.title,
-                        isExclusiveTaskPlacement: other.allowedOverlaps.isEmpty,
-                        isTaskPlacement: true
-                    )
-                )
-            }
-        }
-        return blocks
+        return TaskAvailability.occupancy(
+            calendarItems: calendar.occupancyItems(from: now, dayCount: days),
+            tasks: tasks,
+            excluding: task
+        )
     }
 
     func setCompleted(_ task: ScedraTask, isCompleted: Bool, at now: Date = Date()) {
         guard let index = tasks.firstIndex(where: { $0.id == task.id }) else { return }
         tasks[index].setCompleted(isCompleted, at: now)
         persist()
-        reconcile(now: now)
+        _ = reconcile(now: now)
+    }
+
+    func setCompleted(
+        _ task: ScedraTask,
+        isCompleted: Bool,
+        from writer: any TaskCalendarWriter,
+        at now: Date = Date()
+    ) async {
+        setCompleted(task, isCompleted: isCompleted, at: now)
+        await pruneCompleted(writer: writer, now: now)
     }
 
     func reload() {
         tasks = store.load()
-        reconcile()
+        _ = reconcile()
     }
 
-    /// Auto-completes elapsed placements and drops completed rows past the retain window.
-    func reconcile(now: Date = Date()) {
+    /// Auto-completes elapsed placements and drops completed rows after the 24h window.
+    @discardableResult
+    func reconcile(now: Date = Date()) -> [String] {
         var next = tasks
         var changed = false
         for index in next.indices {
@@ -284,33 +317,112 @@ final class TaskRepository {
                 changed = true
             }
         }
-        let kept = next.filter { $0.shouldRetainCompleted(at: now) }
-        if kept.count != next.count {
+        var prunedIDs: [String] = []
+        let kept = next.filter { task in
+            if task.shouldRetainCompleted(at: now) { return true }
+            if let id = task.calendarEventIdentifier, !id.isEmpty {
+                prunedIDs.append(id)
+            }
             changed = true
-            next = kept
+            return false
         }
-        guard changed else { return }
-        tasks = next
+        guard changed else { return prunedIDs }
+        tasks = kept
+        persist()
+        return prunedIDs
+    }
+
+    func pruneCompleted(writer: any TaskCalendarWriter, now: Date = Date()) async {
+        let ids = reconcile(now: now)
+        for id in ids {
+            try? await writer.deleteTaskEvent(identifier: id)
+        }
+    }
+
+    /// Re-runs priority placement: important / closer deadline take the earlier slot,
+    /// bumped Scedra tasks move later, Apple Calendar appointments stay put.
+    func reconcilePlacements(
+        writer: any TaskCalendarWriter,
+        busy: [TaskBusyBlock],
+        now: Date = Date(),
+        scheduler: any TaskAutoScheduler = DefaultTaskAutoScheduler()
+    ) async {
+        _ = reconcile(now: now)
+        let open = tasks.filter { !$0.isCompleted }
+        guard !open.isEmpty else { return }
+        let previousIDs = Dictionary(
+            uniqueKeysWithValues: tasks.map { ($0.id, $0.calendarEventIdentifier) }
+        )
+        let calendarBusy = busy.filter { !$0.isTaskPlacement }
+        let scheduled = TaskPlacement.schedulePrioritized(
+            open,
+            calendarBusy: calendarBusy,
+            now: now,
+            scheduler: scheduler
+        )
+        var byID = Dictionary(uniqueKeysWithValues: scheduled.map { ($0.id, $0) })
+        tasks = tasks.map { byID[$0.id] ?? $0 }
+        persist()
+        await syncPlacedEvents(scheduled, previousIDs: previousIDs, writer: writer)
+    }
+
+    func reconcilePlacements(
+        calendar: CalendarStore,
+        now: Date = Date(),
+        scheduler: any TaskAutoScheduler = DefaultTaskAutoScheduler()
+    ) async {
+        await reconcilePlacements(
+            writer: calendar,
+            busy: calendarOccupancy(from: calendar, now: now),
+            now: now,
+            scheduler: scheduler
+        )
+    }
+
+    private func calendarOccupancy(from calendar: CalendarStore, now: Date) -> [TaskBusyBlock] {
+        TaskAvailability.occupancy(
+            calendarItems: calendar.occupancyItems(
+                from: now,
+                dayCount: DefaultTaskAutoScheduler.horizonDays
+            ),
+            tasks: tasks
+        )
+    }
+
+    private func syncPlacedEvents(
+        _ scheduled: [ScedraTask],
+        previousIDs: [UUID: String?],
+        writer: any TaskCalendarWriter
+    ) async {
+        for placed in scheduled {
+            let previousEventID = placed.calendarEventIdentifier ?? previousIDs[placed.id] ?? nil
+            if let start = placed.scheduledStart, let end = placed.scheduledEnd {
+                do {
+                    let identifier = try await writer.upsertTaskEvent(
+                        existingIdentifier: previousEventID,
+                        title: placed.title,
+                        start: start,
+                        end: end,
+                        location: placed.location,
+                        notes: placed.notes
+                    )
+                    if let index = tasks.firstIndex(where: { $0.id == placed.id }) {
+                        tasks[index].calendarEventIdentifier = identifier
+                    }
+                } catch {
+                    // Keep the local slot. Identifier stays as the previous EventKit id if we had one.
+                }
+            } else if let previousEventID, !previousEventID.isEmpty {
+                try? await writer.deleteTaskEvent(identifier: previousEventID)
+                if let index = tasks.firstIndex(where: { $0.id == placed.id }) {
+                    tasks[index].calendarEventIdentifier = nil
+                }
+            }
+        }
         persist()
     }
 
     private func persist() {
         store.save(tasks)
-    }
-
-    private static func openOrder(_ lhs: ScedraTask, _ rhs: ScedraTask) -> Bool {
-        switch (lhs.deadline, rhs.deadline) {
-        case let (left?, right?) where left != right:
-            return left < right
-        case (_?, nil):
-            return true
-        case (nil, _?):
-            return false
-        default:
-            if lhs.hasScheduledTimePassed != rhs.hasScheduledTimePassed {
-                return lhs.hasScheduledTimePassed
-            }
-            return lhs.createdAt < rhs.createdAt
-        }
     }
 }

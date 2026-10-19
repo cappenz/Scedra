@@ -31,7 +31,10 @@ struct ReviewView: View {
     var onFinished: () -> Void
 
     @Environment(\.dismiss) private var dismiss
+    @Environment(OnboardingGuide.self) private var onboarding
     @AppStorage(UserProfile.homeGapKey) private var homeGap = UserProfile.defaultHomeGapMinutes
+    @AppStorage(UserProfile.searchFromKey) private var searchFromRaw = PlaceSearchFrom.currentLocation.rawValue
+    @AppStorage(UserProfile.driveTimePlacementKey) private var driveTimePlacementRaw = DriveTimePlacement.partOfEvent.rawValue
     @State private var index = 0
     @State private var errorMessage: String?
     @State private var isSaving = false
@@ -57,6 +60,7 @@ struct ReviewView: View {
     }
 
     var body: some View {
+        @Bindable var onboarding = onboarding
         ZStack {
             ScedraTheme.background.ignoresSafeArea(edges: .top)
 
@@ -225,6 +229,15 @@ struct ReviewView: View {
     /// Sticky Confirm + error, kept above the home indicator (tab bar is hidden on Review).
     private var confirmFooter: some View {
         VStack(alignment: .leading, spacing: 10) {
+            if onboarding.eventWalkthrough == .review {
+                HStack {
+                    Spacer(minLength: 8)
+                    OnboardingCoachSkipChip {
+                        onboarding.skipEventWalkthrough()
+                    }
+                }
+            }
+
             if let errorMessage {
                 Text(errorMessage)
                     .font(.footnote)
@@ -251,6 +264,11 @@ struct ReviewView: View {
             .buttonStyle(.plain)
             .disabled(isSaving)
             .accessibilityLabel("Confirm")
+            .onboardingCoachPulse(
+                isActive: onboarding.eventWalkthrough == .review,
+                showsArrow: true,
+                arrowSize: 16
+            )
         }
         .padding(.horizontal, 20)
         .padding(.top, 12)
@@ -277,7 +295,7 @@ struct ReviewView: View {
     private var conflictSignature: String {
         guard drafts.indices.contains(index) else { return "" }
         let draft = drafts[index]
-        return "\(index)-\(draft.start.timeIntervalSince1970)-\(draft.end.timeIntervalSince1970)-\(draft.arrivalTarget.timeIntervalSince1970)-\(draft.extraBeforeMinutes)-\(draft.extraAfterMinutes)-\(draft.locationToSave)-\(draft.locationLatitude ?? 0)-\(draft.locationLongitude ?? 0)-\(draft.travelMode.rawValue)"
+        return "\(index)-\(draft.start.timeIntervalSince1970)-\(draft.end.timeIntervalSince1970)-\(draft.arrivalTarget.timeIntervalSince1970)-\(draft.extraBeforeMinutes)-\(draft.extraAfterMinutes)-\(draft.locationToSave)-\(draft.locationLatitude ?? 0)-\(draft.locationLongitude ?? 0)-\(draft.travelMode.rawValue)-\(searchFromRaw)-\(driveTimePlacementRaw)"
     }
 
     private var findingPlaceLabel: String {
@@ -324,6 +342,7 @@ struct ReviewView: View {
                 .background(ScedraTheme.blush, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
 
             locationResolutionRow
+            SearchFromToggle(origin: searchFromBinding)
             if showsDriveSection {
                 AppointmentTravelModeToggle(mode: travelModeBinding)
             }
@@ -500,7 +519,12 @@ struct ReviewView: View {
                 }
             }
         }
-        .presentationDetents(current.originalImageURL == nil ? [.medium, .large] : [.large])
+        .presentationDetents(
+            {
+                if case .photo = ReviewOriginal.presentation(for: current) { return [.large] }
+                return [.medium, .large]
+            }()
+        )
     }
 
     private func originalPhoto(_ url: URL) -> some View {
@@ -554,7 +578,10 @@ struct ReviewView: View {
             } label: {
                 Label(
                     "View original",
-                    systemImage: current.originalImageURL == nil ? "doc.text" : "photo"
+                    systemImage: {
+                        if case .photo = ReviewOriginal.presentation(for: current) { return "photo" }
+                        return "doc.text"
+                    }()
                 )
                     .font(.subheadline.weight(.semibold))
                     .frame(maxWidth: .infinity)
@@ -580,6 +607,27 @@ struct ReviewView: View {
                 guard drafts.indices.contains(index) else { return }
                 drafts[index].travelMode = newValue
                 scheduleTravelEstimate()
+            }
+        )
+    }
+
+    private var searchFromBinding: Binding<PlaceSearchFrom> {
+        Binding(
+            get: { PlaceSearchFrom(rawValue: searchFromRaw) ?? .currentLocation },
+            set: { newValue in
+                let previous = PlaceSearchFrom(rawValue: searchFromRaw) ?? .currentLocation
+                searchFromRaw = newValue.rawValue
+                guard previous != newValue, drafts.indices.contains(index) else { return }
+                drafts[index].clearResolvedPlace()
+                locationNote = nil
+                resolveTask?.cancel()
+                travelTask?.cancel()
+                travel = showsDriveSection ? .estimating : .idle
+                let task = Task {
+                    await resolveCurrentPlace()
+                    scheduleTravelEstimate()
+                }
+                resolveTask = task
             }
         )
     }
@@ -628,6 +676,7 @@ struct ReviewView: View {
         _ = commitTypedFields()
         focusedField = nil
         ScedraKeyboard.resign()
+        syncTypedFields(force: true)
     }
 
     /// Applies whatever she typed. Unchanged canonical text is left alone so Confirm
@@ -799,14 +848,45 @@ struct ReviewView: View {
         return nil
     }
 
-    /// What goes on the calendar: the appointment plus the drive and extra time.
+    /// What goes on the calendar: padded appointment, or official times plus a drive event.
     private var calendarBlock: TravelEstimator.CalendarBlock {
-        TravelEstimator.calendarBlock(
-            start: current.arrivalTarget,
-            end: current.end,
+        let plan = driveTimePlan
+        return TravelEstimator.CalendarBlock(
+            start: plan.appointmentStart,
+            end: plan.appointmentEnd,
+            isPadded: plan.isAppointmentPadded
+        )
+    }
+
+    private var driveTimePlan: DriveTimePlan {
+        DriveTimeLogic.plan(
+            officialStart: current.arrivalTarget,
+            officialEnd: current.end,
             travel: readyTravel,
             extraBeforeMinutes: current.extraBeforeMinutes,
-            extraAfterMinutes: current.extraAfterMinutes
+            extraAfterMinutes: current.extraAfterMinutes,
+            place: current.locationToSave,
+            appointmentTitle: current.calendarTitle,
+            placement: DriveTimePlacement(rawValue: driveTimePlacementRaw) ?? .partOfEvent,
+            neighbors: neighborsForCurrent
+        )
+    }
+
+    private var neighborsForCurrent: DriveNeighborContext {
+        let start = current.arrivalTarget
+        let candidates = (calendar.today + calendar.selectedDayEvents)
+            .filter { !$0.isAllDay && !$0.isDriveEvent }
+            .sorted { $0.officialStart < $1.officialStart }
+        let previous = candidates.last { $0.officialStart < start }
+        let next = candidates.first { $0.officialStart > start }
+        let homeLabel = (UserDefaults.standard.string(forKey: PlaceResolver.homeAddressKey) ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return DriveTimeLogic.neighborsForExistingReturn(
+            previousPlace: previous?.placeLabel,
+            homeIsSet: PlaceResolver.isHomeAddressSet,
+            homeLabel: homeLabel,
+            nextPlace: next?.placeLabel,
+            travel: readyTravel
         )
     }
 
@@ -980,8 +1060,15 @@ struct ReviewView: View {
             conflicts = []
             return
         }
-        let block = calendarBlock
-        conflicts = calendar.conflicts(overlapping: block.start, end: block.end)
+        let plan = driveTimePlan
+        var found = calendar.conflicts(overlapping: plan.appointmentStart, end: plan.appointmentEnd)
+        for drive in [plan.driveEvent, plan.returnDriveEvent].compactMap({ $0 }) {
+            for conflict in calendar.conflicts(overlapping: drive.start, end: drive.end)
+            where !found.contains(where: { $0.id == conflict.id }) {
+                found.append(conflict)
+            }
+        }
+        conflicts = found
     }
 
     private func conflictTime(_ conflict: CalendarConflict) -> String {

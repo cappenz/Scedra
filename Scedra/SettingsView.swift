@@ -8,10 +8,13 @@ struct SettingsView: View {
     @AppStorage(UserProfile.standingBringKey) private var standingBring = ""
     @AppStorage(UserProfile.travelModeKey) private var travelModeRaw = TravelMode.drive.rawValue
     @AppStorage(UserProfile.walkMinutesKey) private var walkMinutes = 15
+    @AppStorage(UserProfile.driveTimePlacementKey) private var driveTimePlacementRaw = DriveTimePlacement.partOfEvent.rawValue
     @AppStorage(ScedraThemeStore.key) private var themeID = ScedraThemeID.lavender.rawValue
     @State private var details = ProfileDetailsStore.load()
     @FocusState private var focusedField: SettingsField?
+    @State private var highlightHome = false
     @Environment(\.dismiss) private var dismiss
+    @Environment(OnboardingGuide.self) private var onboarding
 
     private enum SettingsField: Hashable {
         case name, standingBring, home, notes
@@ -26,22 +29,36 @@ struct SettingsView: View {
         )
     }
 
+    private var driveTimePlacement: Binding<DriveTimePlacement> {
+        Binding(
+            get: { DriveTimePlacement(rawValue: driveTimePlacementRaw) ?? .partOfEvent },
+            set: { driveTimePlacementRaw = $0.rawValue }
+        )
+    }
+
     var body: some View {
         NavigationStack {
             ZStack {
                 ScedraTheme.background.ignoresSafeArea()
 
-                ScrollView {
-                    VStack(alignment: .leading, spacing: 22) {
-                        profileCard
-                        moveCard
-                        betweenStopsCard
-                        homeCard
-                        detailsCard
+                ScrollViewReader { proxy in
+                    ScrollView {
+                        VStack(alignment: .leading, spacing: 22) {
+                            profileCard
+                            OnboardingSettingsEntry(guide: onboarding) {
+                                dismiss()
+                            }
+                            moveCard
+                            betweenStopsCard
+                            homeCard
+                                .id(Self.homeAnchor)
+                            detailsCard
+                        }
+                        .padding(20)
                     }
-                    .padding(20)
+                    .scrollDismissesKeyboard(.immediately)
+                    .onAppear { scrollToHomeIfRequested(proxy: proxy) }
                 }
-                .scrollDismissesKeyboard(.immediately)
             }
             .scedraDismissesKeyboard($focusedField)
             .scedraUsesSelectedTheme()
@@ -155,6 +172,17 @@ struct SettingsView: View {
             Text("Walk is a mention only. Events never move.")
                 .font(.footnote)
                 .foregroundStyle(.secondary)
+
+            Picker("Drive time", selection: driveTimePlacement) {
+                ForEach(DriveTimePlacement.allCases) { placement in
+                    Text(placement.title).tag(placement)
+                }
+            }
+            .pickerStyle(.segmented)
+            .tint(ScedraTheme.purple)
+            Text("Existing calendar events get drive time above and below. New events you save in Scedra use this choice.")
+                .font(.footnote)
+                .foregroundStyle(.secondary)
         }
         .scedraCard()
     }
@@ -203,11 +231,31 @@ struct SettingsView: View {
                 .onSubmit { focusedField = nil }
                 .padding(12)
                 .background(ScedraTheme.blush, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
-            Text("Review drive times start here.")
+            Text("Used when Search from is Home, or there’s no pin.")
                 .font(.footnote)
                 .foregroundStyle(.secondary)
         }
         .scedraCard()
+        .overlay {
+            if highlightHome {
+                RoundedRectangle(cornerRadius: 28, style: .continuous)
+                    .stroke(ScedraTheme.purple, lineWidth: 2)
+            }
+        }
+    }
+
+    private static let homeAnchor = "settings-home"
+
+    private func scrollToHomeIfRequested(proxy: ScrollViewProxy) {
+        guard onboarding.pendingFocusHome else { return }
+        onboarding.consumePendingFocusHome()
+        highlightHome = true
+        Task { @MainActor in
+            try? await Task.sleep(for: .milliseconds(180))
+            withAnimation(.easeInOut(duration: 0.35)) {
+                proxy.scrollTo(Self.homeAnchor, anchor: .bottom)
+            }
+        }
     }
 
     private var detailsCard: some View {

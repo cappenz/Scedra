@@ -114,7 +114,11 @@ struct TaskBusyBlock: Equatable, Sendable {
     init(_ item: TodayItem) {
         start = item.start
         end = item.end
-        kind = TaskOverlapKind.inferred(fromTitle: item.title)
+        if item.isDriveEvent {
+            kind = item.appointmentTravelMode == .transit ? .transit : .driving
+        } else {
+            kind = TaskOverlapKind.inferred(fromTitle: item.title)
+        }
         title = item.title
         isTaskPlacement = false
         isExclusiveTaskPlacement = false
@@ -278,5 +282,29 @@ enum TaskAvailability {
     /// Timed calendar items only. All-day rows are presence, not a clock block.
     static func busyBlocks(from items: [TodayItem]) -> [TaskBusyBlock] {
         items.filter { !$0.isAllDay }.map(TaskBusyBlock.init)
+    }
+
+    /// Real occupancy for `placeAndSave`: EventKit events (never task placements)
+    /// plus every other open placed Scedra task. Drive/walk/transit titles may
+    /// host overlap chips; a normal appointment is focused work and never hosts.
+    static func occupancy(
+        calendarItems: [TodayItem],
+        tasks: [ScedraTask],
+        excluding excluded: ScedraTask? = nil
+    ) -> [TaskBusyBlock] {
+        var excludingIDs = Set(
+            tasks.compactMap(\.calendarEventIdentifier).filter { !$0.isEmpty }
+        )
+        if let id = excluded?.calendarEventIdentifier, !id.isEmpty {
+            excludingIDs.insert(id)
+        }
+        let items = calendarItems.filter { !excludingIDs.contains($0.id) }
+        var blocks = busyBlocks(from: items)
+        for other in tasks where other.id != excluded?.id && !other.isCompleted {
+            if let block = TaskPlacement.occupancyBlock(for: other) {
+                blocks.append(block)
+            }
+        }
+        return blocks
     }
 }

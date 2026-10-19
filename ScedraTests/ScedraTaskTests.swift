@@ -363,7 +363,7 @@ final class ScedraTaskTests: XCTestCase {
         )
     }
 
-    // MARK: - Auto-complete + retain
+    // MARK: - Auto-complete + prune
 
     func testScheduledEndInThePastCompletesTheTask() {
         var task = ScedraTask(title: "Call dentist", estimatedDurationMinutes: 10)
@@ -377,10 +377,20 @@ final class ScedraTaskTests: XCTestCase {
         XCTAssertEqual(task.completedAt, time(10, 10))
         XCTAssertEqual(task.progressStatus(at: time(12)), .completed)
         XCTAssertEqual(task.calendarEventIdentifier, nil, "completion does not invent or clear a calendar id")
+        XCTAssertTrue(task.shouldRetainCompleted(at: time(12)), "still visible the same day")
+        XCTAssertTrue(
+            task.shouldRetainCompleted(at: time(10, 10).addingTimeInterval(23 * 3600)),
+            "visible for 24 hours after completedAt"
+        )
+        XCTAssertFalse(
+            task.shouldRetainCompleted(at: time(10, 10).addingTimeInterval(TaskRetention.completedVisibleFor + 1)),
+            "pruned after 24 hours"
+        )
+        XCTAssertEqual(TaskRetention.completedVisibleFor, 24 * 3600)
     }
 
     @MainActor
-    func testRepositoryAutoCompletesElapsedPlacement() {
+    func testRepositoryKeepsElapsedCompletedTaskUntilRetentionWindow() {
         let repository = TaskRepository(store: MemoryTaskStore())
         var task = ScedraTask(title: "Call dentist", estimatedDurationMinutes: 10)
         task.applyPlacement(start: time(8))
@@ -389,46 +399,57 @@ final class ScedraTaskTests: XCTestCase {
 
         XCTAssertTrue(repository.openTasks.isEmpty)
         XCTAssertEqual(repository.completedTasks(at: time(12)).count, 1)
-        XCTAssertTrue(repository.completedTasks(at: time(12))[0].isCompleted)
-        XCTAssertEqual(repository.completedTasks(at: time(12))[0].scheduledStart, time(8))
+        XCTAssertEqual(repository.tasks.count, 1, "completed after scheduledEnd stays until the 24h prune")
+        XCTAssertEqual(repository.tasks[0].completedAt, time(8, 10))
     }
 
     @MainActor
-    func testRecentlyCompletedTaskStaysVisible() {
+    func testManualCompleteBeforeScheduledEndPrunes24hAfterCompletedAt() {
         let repository = TaskRepository(store: MemoryTaskStore())
-        let now = Date()
-        var task = ScedraTask(title: "Call dentist", estimatedDurationMinutes: 10)
-        task.applyPlacement(start: now.addingTimeInterval(-20 * 60))
+        var task = ScedraTask(title: "Call dentist", estimatedDurationMinutes: 30)
+        task.applyPlacement(start: time(10))
         repository.upsert(task)
-        repository.setCompleted(repository.tasks[0], isCompleted: true, at: now)
+        repository.setCompleted(repository.tasks[0], isCompleted: true, at: time(10, 5))
 
-        XCTAssertEqual(repository.completedTasks(at: now).count, 1)
-        XCTAssertEqual(repository.completedTasks(at: now.addingTimeInterval(2 * 60 * 60)).count, 1)
+        XCTAssertEqual(repository.completedTasks(at: time(10, 5)).count, 1)
+        XCTAssertEqual(repository.completedTasks(at: time(10, 31)).count, 1, "past scheduledEnd is still completed, not deleted")
+        XCTAssertEqual(
+            repository.completedTasks(at: time(10, 5).addingTimeInterval(23 * 3600)).count,
+            1
+        )
+        XCTAssertTrue(
+            repository.completedTasks(at: time(10, 5).addingTimeInterval(TaskRetention.completedVisibleFor + 1)).isEmpty
+        )
+        _ = repository.reconcile(now: time(10, 5).addingTimeInterval(TaskRetention.completedVisibleFor + 1))
+        XCTAssertTrue(repository.tasks.isEmpty)
     }
 
     @MainActor
-    func testCompletedTaskOlderThanRetainWindowIsPruned() {
-        XCTAssertEqual(TaskRetention.completedVisibleFor, 24 * 60 * 60)
+    func testCompletedOlderThan24HoursIsGoneFromStore() {
         let old = ScedraTask(
             title: "Stale",
             isCompleted: true,
-            completedAt: Date().addingTimeInterval(-25 * 60 * 60)
+            completedAt: time(9),
+            scheduledStart: time(8),
+            scheduledEnd: time(8, 30)
         )
         let stored = MemoryTaskStore(tasks: [old])
         let loaded = TaskRepository(store: stored)
-        XCTAssertTrue(loaded.completedTasks.isEmpty)
+        loaded.reconcile(now: time(9).addingTimeInterval(TaskRetention.completedVisibleFor + 60))
+        XCTAssertTrue(loaded.completedTasks(at: time(9).addingTimeInterval(TaskRetention.completedVisibleFor + 60)).isEmpty)
         XCTAssertTrue(loaded.tasks.isEmpty)
         XCTAssertTrue(stored.load().isEmpty, "pruned rows are dropped from persistence")
     }
 
     @MainActor
-    func testManualCompleteStartsRetainWindow() {
+    func testUnscheduledCompletedTaskStaysFor24Hours() {
         let repository = TaskRepository(store: MemoryTaskStore())
-        let now = Date()
         repository.upsert(ScedraTask(title: "Call dentist", estimatedDurationMinutes: 10))
-        repository.setCompleted(repository.openTasks[0], isCompleted: true, at: now)
-        XCTAssertEqual(repository.completedTasks(at: now).first?.completedAt, now)
-        XCTAssertTrue(repository.completedTasks(at: now.addingTimeInterval(25 * 60 * 60)).isEmpty)
+        repository.setCompleted(repository.openTasks[0], isCompleted: true, at: time(10))
+        XCTAssertEqual(repository.completedTasks(at: time(10)).count, 1)
+        XCTAssertEqual(repository.tasks.count, 1)
+        _ = repository.reconcile(now: time(10).addingTimeInterval(TaskRetention.completedVisibleFor + 1))
+        XCTAssertTrue(repository.tasks.isEmpty)
     }
 
     // MARK: - Store
@@ -524,21 +545,36 @@ final class ScedraTaskTests: XCTestCase {
     }
 
     @MainActor
-    func testCompletingATaskDoesNotDeleteCalendarEvent() async {
+    func testCompletingATaskKeepsCalendarEventUntilRetentionPrune() async {
         let writer = MemoryTaskCalendarWriter()
         let repository = TaskRepository(store: MemoryTaskStore())
         let task = ScedraTask(title: "Call dentist", estimatedDurationMinutes: 30)
         await repository.placeAndSave(task, writer: writer, busy: [], now: time(9), scheduler: scheduler)
         let placed = repository.openTasks[0]
         XCTAssertEqual(placed.calendarEventIdentifier, writer.upserts[0].identifier)
+        XCTAssertEqual(placed.scheduledEnd, time(10))
 
-        repository.setCompleted(placed, isCompleted: true, at: time(9, 5))
+        await repository.setCompleted(placed, isCompleted: true, from: writer, at: time(9, 5))
 
-        XCTAssertTrue(writer.deletedIdentifiers.isEmpty, "checking a task off leaves the calendar block")
+        XCTAssertTrue(writer.deletedIdentifiers.isEmpty, "checking off keeps the calendar block until prune")
         XCTAssertEqual(
             repository.completedTasks(at: time(9, 5)).first?.calendarEventIdentifier,
             placed.calendarEventIdentifier
         )
+
+        await repository.pruneCompleted(
+            writer: writer,
+            now: time(9, 5).addingTimeInterval(23 * 3600)
+        )
+        XCTAssertTrue(writer.deletedIdentifiers.isEmpty)
+        XCTAssertEqual(repository.tasks.count, 1)
+
+        await repository.pruneCompleted(
+            writer: writer,
+            now: time(9, 5).addingTimeInterval(TaskRetention.completedVisibleFor + 1)
+        )
+        XCTAssertEqual(writer.deletedIdentifiers, [placed.calendarEventIdentifier ?? ""])
+        XCTAssertTrue(repository.tasks.isEmpty)
     }
 
     @MainActor
@@ -658,5 +694,386 @@ final class ScedraTaskTests: XCTestCase {
         await repository.delete(placed, from: writer)
         XCTAssertEqual(writer.deletedIdentifiers, [placed.calendarEventIdentifier ?? ""])
         XCTAssertTrue(repository.tasks.isEmpty)
+    }
+
+    @MainActor
+    func testImportantTaskBumpsANormalTaskOffTheNextSlot() async throws {
+        let writer = MemoryTaskCalendarWriter()
+        let repository = TaskRepository(store: MemoryTaskStore())
+        let meeting = TaskBusyBlock(
+            start: time(16),
+            end: time(17),
+            kind: .meeting,
+            title: "Standup"
+        )
+        let normal = ScedraTask(title: "Homework", estimatedDurationMinutes: 30, importance: .normal)
+        await repository.placeAndSave(
+            normal,
+            writer: writer,
+            busy: [meeting],
+            now: time(9),
+            scheduler: scheduler
+        )
+        let placedNormal = repository.openTasks[0]
+        XCTAssertEqual(placedNormal.scheduledStart, time(9, 30))
+
+        let important = ScedraTask(title: "Call dentist", estimatedDurationMinutes: 30, importance: .important)
+        await repository.placeAndSave(
+            important,
+            writer: writer,
+            busy: [meeting],
+            now: time(9),
+            scheduler: scheduler
+        )
+
+        let call = try XCTUnwrap(repository.openTasks.first { $0.title == "Call dentist" })
+        let homework = try XCTUnwrap(repository.openTasks.first { $0.title == "Homework" })
+        XCTAssertEqual(call.scheduledStart, time(9, 30), "important takes the next good slot")
+        XCTAssertEqual(homework.scheduledStart, time(10, 10), "normal is re-placed later")
+        XCTAssertNotEqual(homework.scheduledStart, time(16), "do not displace onto a meeting")
+        XCTAssertLessThan(homework.scheduledEnd ?? time(20), time(16))
+        XCTAssertEqual(meeting.start, time(16), "calendar appointments never move")
+    }
+
+    func testImportantTakesAnEarlierSlotHeldByANormalTask() throws {
+        var homework = ScedraTask(title: "Homework", estimatedDurationMinutes: 30, importance: .normal)
+        homework.applyPlacement(start: time(9, 30))
+        var call = ScedraTask(title: "Call dentist", estimatedDurationMinutes: 30, importance: .important)
+        call.applyPlacement(start: time(11))
+        let meeting = TaskBusyBlock(
+            start: time(16),
+            end: time(17),
+            kind: .meeting,
+            title: "Standup"
+        )
+
+        let result = TaskPlacement.schedulePrioritized(
+            [homework, call],
+            calendarBusy: [meeting],
+            now: time(9),
+            scheduler: scheduler
+        )
+        let placedCall = try XCTUnwrap(result.first { $0.title == "Call dentist" })
+        let placedHomework = try XCTUnwrap(result.first { $0.title == "Homework" })
+        XCTAssertEqual(placedCall.scheduledStart, time(9, 30), "important wins the earlier slot")
+        XCTAssertEqual(placedHomework.scheduledStart, time(10, 10), "normal is re-placed later")
+        XCTAssertEqual(meeting.start, time(16), "calendar appointments never move")
+    }
+
+    func testCloserDeadlineTakesTheEarlierSlotAmongSameImportance() throws {
+        var later = ScedraTask(title: "Later", estimatedDurationMinutes: 30, deadline: time(18))
+        later.applyPlacement(start: time(9, 30))
+        let sooner = ScedraTask(title: "Sooner", estimatedDurationMinutes: 30, deadline: time(12))
+
+        let result = TaskPlacement.schedulePrioritized(
+            [later, sooner],
+            calendarBusy: [],
+            now: time(9),
+            scheduler: scheduler
+        )
+        XCTAssertEqual(result.first { $0.title == "Sooner" }?.scheduledStart, time(9, 30))
+        XCTAssertEqual(result.first { $0.title == "Later" }?.scheduledStart, time(10, 10))
+    }
+
+    @MainActor
+    func testReconcilePlacementsRunsPriorityBumpForAnImportantTask() async throws {
+        let writer = MemoryTaskCalendarWriter()
+        let repository = TaskRepository(store: MemoryTaskStore())
+        let meeting = TaskBusyBlock(
+            start: time(16),
+            end: time(17),
+            kind: .meeting,
+            title: "Standup"
+        )
+        var homework = ScedraTask(title: "Homework", estimatedDurationMinutes: 30)
+        homework.applyPlacement(start: time(9, 30))
+        repository.upsert(homework)
+        var call = ScedraTask(title: "Call dentist", estimatedDurationMinutes: 30, importance: .important)
+        call.applyPlacement(start: time(11))
+        repository.upsert(call)
+
+        await repository.reconcilePlacements(
+            writer: writer,
+            busy: [meeting],
+            now: time(9),
+            scheduler: scheduler
+        )
+
+        let placedCall = try XCTUnwrap(repository.openTasks.first { $0.title == "Call dentist" })
+        let placedHomework = try XCTUnwrap(repository.openTasks.first { $0.title == "Homework" })
+        XCTAssertEqual(placedCall.scheduledStart, time(9, 30), "reconcile is not a stub — important takes the slot")
+        XCTAssertEqual(placedHomework.scheduledStart, time(10, 10))
+        XCTAssertNotEqual(placedHomework.scheduledStart, time(16))
+        XCTAssertEqual(meeting.start, time(16))
+        XCTAssertTrue(writer.upserts.contains { $0.title == "Call dentist" && $0.start == time(9, 30) })
+        XCTAssertTrue(writer.upserts.contains { $0.title == "Homework" && $0.start == time(10, 10) })
+    }
+
+    // MARK: - Occupancy from calendar items (real placeAndSave wiring)
+
+    func testOccupancyFromCalendarItemsMarksAppointmentsNotTasks() {
+        let dentist = TodayItem(
+            id: "ek-dentist",
+            title: "Dentist",
+            start: time(10),
+            end: time(11),
+            isAllDay: false,
+            location: "Clinic"
+        )
+        let homework = ScedraTask(title: "Homework", estimatedDurationMinutes: 30)
+        let busy = TaskAvailability.occupancy(
+            calendarItems: [dentist],
+            tasks: [],
+            excluding: homework
+        )
+        XCTAssertEqual(busy.count, 1)
+        XCTAssertEqual(busy[0].title, "Dentist")
+        XCTAssertEqual(busy[0].kind, .focusedWork, "a normal appointment is never a drive/walk host")
+        XCTAssertFalse(busy[0].isTaskPlacement)
+        XCTAssertEqual(
+            TaskAvailability.evaluatePlacement(task: homework, start: time(10), busy: busy),
+            .doesNotFit
+        )
+        XCTAssertEqual(
+            TaskAvailability.evaluatePlacement(task: homework, start: time(11), busy: busy),
+            .doesNotFit,
+            "10-minute buffer after the appointment"
+        )
+    }
+
+    func testOverlapChipsDoNotSitOnANormalAppointment() {
+        let dentist = TodayItem(
+            id: "ek-dentist",
+            title: "Dentist",
+            start: time(10),
+            end: time(11),
+            isAllDay: false,
+            location: "Clinic"
+        )
+        let call = ScedraTask(
+            title: "Call dentist",
+            estimatedDurationMinutes: 10,
+            allowedOverlaps: [.driving, .walking, .waiting, .transit]
+        )
+        let busy = TaskAvailability.occupancy(
+            calendarItems: [dentist],
+            tasks: [],
+            excluding: call
+        )
+        XCTAssertEqual(
+            TaskAvailability.evaluatePlacement(task: call, start: time(10), busy: busy),
+            .doesNotFit,
+            "driving chips may sit on a commute, not on a dentist appointment"
+        )
+    }
+
+    func testOccupancyKeepsOtherPlacedTasksAsOccupants() {
+        var homework = ScedraTask(title: "Homework", estimatedDurationMinutes: 30)
+        homework.applyPlacement(start: time(9, 30))
+        homework.calendarEventIdentifier = "ek-homework"
+        let important = ScedraTask(title: "Call dentist", estimatedDurationMinutes: 30, importance: .important)
+        let standup = TodayItem(
+            id: "ek-standup",
+            title: "Standup",
+            start: time(16),
+            end: time(17),
+            isAllDay: false,
+            location: nil
+        )
+        let homeworkEvent = TodayItem(
+            id: "ek-homework",
+            title: "Homework",
+            start: time(9, 30),
+            end: time(10),
+            isAllDay: false,
+            location: nil
+        )
+        let busy = TaskAvailability.occupancy(
+            calendarItems: [standup, homeworkEvent],
+            tasks: [homework],
+            excluding: important
+        )
+        XCTAssertTrue(busy.contains { $0.title == "Standup" && !$0.isTaskPlacement })
+        XCTAssertTrue(
+            busy.contains { $0.title == "Homework" && $0.isTaskPlacement },
+            "other Scedra tasks stay occupants after their EventKit row is stripped"
+        )
+        XCTAssertFalse(
+            busy.contains { $0.title == "Homework" && !$0.isTaskPlacement },
+            "the task's own EventKit row must not also count as a calendar appointment"
+        )
+    }
+
+    @MainActor
+    func testPlaceAndSaveUsesOccupancySoExclusiveTaskMissesTheAppointment() async {
+        let writer = MemoryTaskCalendarWriter()
+        let repository = TaskRepository(store: MemoryTaskStore())
+        let dentist = TodayItem(
+            id: "ek-dentist",
+            title: "Dentist",
+            start: time(10),
+            end: time(11),
+            isAllDay: false,
+            location: "Clinic"
+        )
+        let homework = ScedraTask(title: "Homework", estimatedDurationMinutes: 30)
+        let busy = TaskAvailability.occupancy(
+            calendarItems: [dentist],
+            tasks: repository.tasks,
+            excluding: homework
+        )
+        await repository.placeAndSave(
+            homework,
+            writer: writer,
+            busy: busy,
+            now: time(9),
+            scheduler: scheduler
+        )
+        XCTAssertEqual(
+            repository.openTasks[0].scheduledStart,
+            time(11, 10),
+            "placeAndSave must keep the 10-minute buffer after the EventKit event"
+        )
+        XCTAssertNotEqual(repository.openTasks[0].scheduledStart, time(9, 30))
+        XCTAssertEqual(dentist.start, time(10), "calendar appointments never move")
+    }
+
+    @MainActor
+    func testPlaceAndSaveOccupancyBumpsNormalTaskOffTheEarlierSlot() async throws {
+        let writer = MemoryTaskCalendarWriter()
+        let repository = TaskRepository(store: MemoryTaskStore())
+        let standup = TodayItem(
+            id: "ek-standup",
+            title: "Standup",
+            start: time(16),
+            end: time(17),
+            isAllDay: false,
+            location: nil
+        )
+        let meetingBusy = TaskAvailability.occupancy(
+            calendarItems: [standup],
+            tasks: [],
+            excluding: ScedraTask(title: "Homework", estimatedDurationMinutes: 30)
+        )
+        await repository.placeAndSave(
+            ScedraTask(title: "Homework", estimatedDurationMinutes: 30, importance: .normal),
+            writer: writer,
+            busy: meetingBusy,
+            now: time(9),
+            scheduler: scheduler
+        )
+        XCTAssertEqual(repository.openTasks[0].scheduledStart, time(9, 30))
+
+        let important = ScedraTask(title: "Call dentist", estimatedDurationMinutes: 30, importance: .important)
+        let busy = TaskAvailability.occupancy(
+            calendarItems: [standup],
+            tasks: repository.tasks,
+            excluding: important
+        )
+        XCTAssertTrue(busy.contains { $0.isTaskPlacement && $0.title == "Homework" })
+        await repository.placeAndSave(
+            important,
+            writer: writer,
+            busy: busy,
+            now: time(9),
+            scheduler: scheduler
+        )
+
+        let call = try XCTUnwrap(repository.openTasks.first { $0.title == "Call dentist" })
+        let homework = try XCTUnwrap(repository.openTasks.first { $0.title == "Homework" })
+        XCTAssertEqual(call.scheduledStart, time(9, 30), "important takes the next good slot")
+        XCTAssertEqual(homework.scheduledStart, time(10, 10), "normal is re-placed later")
+        XCTAssertNotEqual(homework.scheduledStart, time(16), "do not displace onto a meeting")
+        XCTAssertEqual(standup.start, time(16), "calendar appointments never move")
+    }
+
+    @MainActor
+    func testHonoredImportantSaveStillTakesTheEarlierSlot() async throws {
+        let writer = MemoryTaskCalendarWriter()
+        let repository = TaskRepository(store: MemoryTaskStore())
+        await repository.placeAndSave(
+            ScedraTask(title: "Homework", estimatedDurationMinutes: 30),
+            writer: writer,
+            busy: [],
+            now: time(9),
+            scheduler: scheduler
+        )
+        var call = ScedraTask(title: "Call dentist", estimatedDurationMinutes: 30, importance: .important)
+        call.applyPlacement(start: time(11))
+        await repository.placeAndSave(
+            call,
+            writer: writer,
+            busy: TaskAvailability.occupancy(
+                calendarItems: [],
+                tasks: repository.tasks,
+                excluding: call
+            ),
+            now: time(9),
+            scheduler: scheduler,
+            honorSchedule: true
+        )
+        XCTAssertEqual(
+            repository.openTasks.first { $0.title == "Call dentist" }?.scheduledStart,
+            time(9, 30)
+        )
+        XCTAssertEqual(
+            repository.openTasks.first { $0.title == "Homework" }?.scheduledStart,
+            time(10, 10)
+        )
+    }
+
+    // MARK: - Calendar event deletion removes the ScedraTask
+
+    @MainActor
+    func testDeletingCalendarIdRemovesTaskFromTheStore() {
+        let repository = TaskRepository(store: MemoryTaskStore())
+        var task = ScedraTask(title: "Call dentist", estimatedDurationMinutes: 10)
+        task.calendarEventIdentifier = "ek-task-1"
+        repository.upsert(task)
+        var completed = ScedraTask(title: "Done", estimatedDurationMinutes: 10, isCompleted: true)
+        completed.calendarEventIdentifier = "ek-task-done"
+        completed.completedAt = time(9)
+        repository.upsert(completed)
+        var other = ScedraTask(title: "Homework", estimatedDurationMinutes: 30)
+        other.calendarEventIdentifier = "ek-task-2"
+        repository.upsert(other)
+        let appointmentless = ScedraTask(title: "Unscheduled")
+        repository.upsert(appointmentless)
+
+        repository.removeMatchingCalendarEvents(["ek-task-1", "ek-task-done"])
+
+        XCTAssertNil(repository.tasks.first { $0.calendarEventIdentifier == "ek-task-1" })
+        XCTAssertNil(repository.tasks.first { $0.title == "Call dentist" })
+        XCTAssertNil(repository.tasks.first { $0.title == "Done" }, "completed list is cleared too")
+        XCTAssertEqual(repository.tasks.first { $0.title == "Homework" }?.calendarEventIdentifier, "ek-task-2")
+        XCTAssertNotNil(repository.tasks.first { $0.title == "Unscheduled" })
+    }
+
+    @MainActor
+    func testMissingCalendarEventRemovesOnlyMatchingTasks() {
+        let repository = TaskRepository(store: MemoryTaskStore())
+        var task = ScedraTask(title: "Call dentist")
+        task.calendarEventIdentifier = "ek-task-1"
+        repository.upsert(task)
+        var leftover = ScedraTask(title: "Homework")
+        leftover.calendarEventIdentifier = "ek-task-2"
+        repository.upsert(leftover)
+
+        repository.removeTasksMissingFromCalendar { id in
+            if id == "ek-task-1" { return false }
+            if id == "ek-task-2" { return true }
+            return nil
+        }
+
+        XCTAssertNil(repository.tasks.first { $0.title == "Call dentist" })
+        XCTAssertEqual(repository.tasks.first { $0.title == "Homework" }?.calendarEventIdentifier, "ek-task-2")
+    }
+
+    func testNewTaskEditorHidesCompletedToggle() {
+        let draft = ScedraTask(title: "Call dentist", estimatedDurationMinutes: 10)
+        XCTAssertTrue(TaskEditorSession.create(draft).isNew)
+        XCTAssertFalse(TaskEditorSession.create(draft).showsCompletedToggle)
+        XCTAssertFalse(TaskEditorSession.edit(draft).isNew)
+        XCTAssertTrue(TaskEditorSession.edit(draft).showsCompletedToggle)
     }
 }

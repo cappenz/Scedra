@@ -53,7 +53,8 @@ final class ScedraHomeGapTests: XCTestCase {
         walk: Int = 15,
         preferTransit: Bool = false,
         minHome: Int = 0,
-        standing: [String] = []
+        standing: [String] = [],
+        occupied: [HomeGapStop] = []
     ) -> HomeGapSuggestion? {
         HomeGapLogic.suggestion(
             first: first,
@@ -71,6 +72,7 @@ final class ScedraHomeGapTests: XCTestCase {
             preferTransit: preferTransit,
             minHomeMinutes: minHome,
             standingBring: standing,
+            occupied: occupied,
             calendar: cal
         )
     }
@@ -235,6 +237,20 @@ final class ScedraHomeGapTests: XCTestCase {
         XCTAssertNil(
             advice(first: clinic, second: sameClinic, aToHome: 20, homeToB: 20, aToB: 5, buffer: 5),
             "same resolved pin — Don’t go home is not the question"
+        )
+    }
+
+    func testSamePlaceStillNoDontGoHome() {
+        var first = stop("a", "Dentist", start: time(14), end: time(15), place: "Clinic")
+        first.latitude = 37.479
+        first.longitude = -122.155
+        var second = stop("b", "Cleaning", start: time(15, 40), end: time(16, 40), place: "Same clinic")
+        second.latitude = first.latitude
+        second.longitude = first.longitude
+        XCTAssertTrue(HomeGapLogic.isSamePlace(first, second))
+        XCTAssertNil(
+            advice(first: first, second: second, aToHome: 20, homeToB: 20, aToB: 4, buffer: 5),
+            "same place still has no Don’t go home card"
         )
     }
 
@@ -885,12 +901,56 @@ final class ScedraHomeGapTests: XCTestCase {
             LeaveToNavigateNotifier.draft(for: item, now: time(8))
         )
         XCTAssertEqual(draft.fire, estimate.leaveBy)
-        XCTAssertEqual(draft.title, String(localized: "Time to leave for school"))
-        XCTAssertTrue(draft.body.contains("Google Maps"), draft.body)
-        XCTAssertTrue(draft.body.contains("Waze"), draft.body)
+        XCTAssertEqual(draft.title, String(localized: "Leave now — drive to school"))
+        XCTAssertEqual(draft.body, String(localized: "Tap to open Maps"))
         XCTAssertEqual(draft.latitude, 39.7817)
         XCTAssertEqual(draft.longitude, -89.6501)
         XCTAssertTrue(draft.identifier.hasPrefix(LeaveToNavigateNotifier.idPrefix))
+
+        let betweenNotes = DriveTimeLogic.driveNotes(
+            chainKey: DriveChainLogic.chainKey(from: "ek-boba", to: "school-leave"),
+            fromID: "ek-boba",
+            toID: "school-leave",
+            linkedAppointmentID: "school-leave",
+            leg: .between
+        )
+        let between = TodayItem(
+            id: "ek-drive-between",
+            title: DriveTimeLogic.betweenEventTitle(from: "Boba", to: "school"),
+            start: time(9, 51),
+            end: time(10, 16),
+            isAllDay: false,
+            location: "school · 100 Example Ave, Springfield, IL 62701",
+            notes: betweenNotes,
+            latitude: 39.7817,
+            longitude: -89.6501
+        )
+        let betweenDraft = try XCTUnwrap(
+            LeaveToNavigateNotifier.draft(for: between, now: time(8))
+        )
+        XCTAssertEqual(betweenDraft.fire, time(9, 51))
+        XCTAssertEqual(betweenDraft.title, String(localized: "Leave now — drive to school"))
+        XCTAssertEqual(betweenDraft.identifier, LeaveToNavigateNotifier.idPrefix + between.id)
+        XCTAssertNil(
+            LeaveToNavigateNotifier.draft(
+                for: between,
+                now: time(9, 51).addingTimeInterval(60)
+            )
+        )
+
+        let driveHome = TodayItem(
+            id: "ek-drive-home",
+            title: ScedraString("Drive home"),
+            start: time(11, 16),
+            end: time(11, 41),
+            isAllDay: false,
+            location: "Home",
+            notes: DriveTimeLogic.driveNotes(forAppointment: "school-leave", leg: .onward),
+            latitude: 37.33,
+            longitude: -122.03
+        )
+        XCTAssertNil(LeaveToNavigateNotifier.draft(for: driveHome, now: time(8)))
+        XCTAssertTrue(LeaveToNavigateNotifier.isGoHomeDrive(driveHome))
 
         XCTAssertEqual(LeaveToNavigateNotifier.mapsApp(for: LeaveToNavigateNotifier.googleAction), "google")
         XCTAssertEqual(LeaveToNavigateNotifier.mapsApp(for: LeaveToNavigateNotifier.wazeAction), "waze")
@@ -955,12 +1015,8 @@ final class ScedraHomeGapTests: XCTestCase {
         )
         XCTAssertEqual(draft.fire, transit.leaveBy)
         XCTAssertEqual(draft.mode, .transit)
-        let destination = item.placeLabel ?? item.title
-        XCTAssertTrue(
-            draft.body.contains(String(localized: "Leave now — transit to \(destination).")),
-            draft.body
-        )
-        XCTAssertFalse(draft.body.contains("Waze"), draft.body)
+        XCTAssertEqual(draft.title, String(localized: "Leave now — transit to McDonald's"))
+        XCTAssertEqual(draft.body, String(localized: "Tap to open Maps"))
 
         let google = try XCTUnwrap(
             MapsHandoff.googleMapsWebURL(latitude: draft.latitude, longitude: draft.longitude, mode: draft.mode)
@@ -970,6 +1026,111 @@ final class ScedraHomeGapTests: XCTestCase {
             MapsHandoff.appleMapsLaunchOptions(mode: .transit)[MKLaunchOptionsDirectionsModeKey],
             MKLaunchOptionsDirectionsModeTransit
         )
+    }
+
+    func testDriveSiblingsBelowMinHomeIsDontGoHome() throws {
+        let dentist = stop("a", "Dentist", start: time(14), end: time(15), place: "Valencia")
+        var driveHome = stop(
+            "dh",
+            ScedraString("Drive home"),
+            start: time(15),
+            end: time(15, 20),
+            place: "Home"
+        )
+        driveHome.isDriveEvent = true
+        driveHome.notes = DriveTimeLogic.driveNotes(forAppointment: "a", leg: .onward)
+        var driveTo = stop(
+            "dt",
+            ScedraString("Drive to Riding"),
+            start: time(15, 40),
+            end: time(16),
+            place: "Westwind Community Barn"
+        )
+        driveTo.isDriveEvent = true
+        driveTo.notes = DriveTimeLogic.driveNotes(forAppointment: "b", leg: .inbound)
+        let riding = stop("b", "Riding", start: time(16), end: time(17), place: "Westwind Community Barn")
+        XCTAssertFalse(HomeGapLogic.isSamePlace(dentist, riding))
+
+        let leftover = HomeGapLogic.leftoverMinutesAtHome(
+            first: dentist,
+            second: riding,
+            occupied: [dentist, driveHome, driveTo, riding],
+            aToHome: 20,
+            homeToB: 20,
+            buffer: 5,
+            before: 0
+        )
+        XCTAssertEqual(leftover, 20, "Drive home and Drive to occupy the legs; 15:20–15:40 is at home")
+
+        let suggestion = try XCTUnwrap(
+            advice(
+                first: dentist,
+                second: riding,
+                aToHome: 20,
+                homeToB: 20,
+                aToB: 12,
+                buffer: 5,
+                minHome: 30,
+                occupied: [dentist, driveHome, driveTo, riding]
+            )
+        )
+        XCTAssertEqual(suggestion.kind, .stayOut)
+        XCTAssertEqual(suggestion.collapsedHeadline, String(localized: "Don’t go home"))
+        XCTAssertTrue(suggestion.detail.contains("20 min at home"), suggestion.detail)
+        XCTAssertTrue(suggestion.detail.contains("need 30"), suggestion.detail)
+    }
+
+    func testDriveEventInGapIsNotCountedAsTimeAtHome() throws {
+        let first = stop("a", "Class", start: time(14), end: time(15), place: "Valencia")
+        var drive = stop(
+            "mid",
+            ScedraString("Drive to Lunch"),
+            start: time(15, 10),
+            end: time(15, 30),
+            place: "Cafe"
+        )
+        drive.isDriveEvent = true
+        let second = stop("b", "Barn", start: time(16), end: time(17), place: "Westwind")
+        let leftover = HomeGapLogic.leftoverMinutesAtHome(
+            first: first,
+            second: second,
+            occupied: [first, drive, second],
+            aToHome: 15,
+            homeToB: 15,
+            buffer: 0,
+            before: 0
+        )
+        XCTAssertEqual(leftover, 15, "the 20 min drive is not sitting at home")
+        XCTAssertNotEqual(leftover, 30)
+        XCTAssertNotEqual(leftover, 60)
+
+        let suggestion = try XCTUnwrap(
+            advice(
+                first: first,
+                second: second,
+                aToHome: 15,
+                homeToB: 15,
+                aToB: 12,
+                buffer: 0,
+                minHome: 30,
+                occupied: [first, drive, second]
+            )
+        )
+        XCTAssertEqual(suggestion.kind, .stayOut)
+        XCTAssertTrue(suggestion.detail.contains("15 min at home"), suggestion.detail)
+    }
+
+    func testConsecutivePairsSkipDriveEvents() {
+        let dentist = stop("a", "Dentist", start: time(14), end: time(15), place: "Valencia")
+        var driveHome = stop("dh", ScedraString("Drive home"), start: time(15), end: time(15, 20))
+        driveHome.isDriveEvent = true
+        var driveTo = stop("dt", ScedraString("Drive to Riding"), start: time(15, 40), end: time(16))
+        driveTo.isDriveEvent = true
+        let riding = stop("b", "Riding", start: time(16), end: time(17), place: "Westwind")
+        let pairs = HomeGapLogic.consecutivePairs(from: [dentist, driveHome, driveTo, riding], calendar: cal)
+        XCTAssertEqual(pairs.count, 1)
+        XCTAssertEqual(pairs[0].0.id, "a")
+        XCTAssertEqual(pairs[0].1.id, "b")
     }
 
     func testLeaveToNavigateNeedsAPinAndALeaveBy() {

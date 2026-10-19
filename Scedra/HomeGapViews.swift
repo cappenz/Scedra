@@ -135,6 +135,41 @@ struct HomeGapCard: View {
 }
 
 /// Driving vs Public transport under a resolved address. Lavender when selected.
+struct SearchFromToggle: View {
+    @Binding var origin: PlaceSearchFrom
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("Search from")
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(ScedraTheme.purple)
+            HStack(spacing: 8) {
+                chip(.currentLocation)
+                chip(.home)
+            }
+            .accessibilityElement(children: .contain)
+            .accessibilityLabel("Search from")
+        }
+    }
+
+    private func chip(_ value: PlaceSearchFrom) -> some View {
+        let selected = origin == value
+        return Button {
+            origin = value
+        } label: {
+            Text(value.title)
+                .font(.caption.weight(.semibold))
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 8)
+                .background(selected ? ScedraTheme.lavender : ScedraTheme.blush, in: Capsule())
+                .foregroundStyle(selected ? ScedraTheme.deepPurple : ScedraTheme.purple)
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(value.title)
+        .accessibilityAddTraits(selected ? .isSelected : [])
+    }
+}
+
 struct AppointmentTravelModeToggle: View {
     @Binding var mode: TravelMode
 

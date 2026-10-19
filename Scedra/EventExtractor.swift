@@ -55,13 +55,25 @@ enum TimeRangeParser {
         guard (1...12).contains(startHourRaw) || (0...23).contains(startHourRaw) else { return nil }
         guard (1...12).contains(endHourRaw) || (0...23).contains(endHourRaw) else { return nil }
         guard startHourRaw <= 23, endHourRaw <= 23, startMinute < 60, endMinute < 60 else { return nil }
-        let startHasMinutes = match.range(at: 2).location != NSNotFound
-        let endHasMinutes = match.range(at: 5).location != NSNotFound
-        if startHourRaw > 12, !startHasMinutes, meridian(at: 3) == nil { return nil }
-        if endHourRaw > 12, !endHasMinutes, meridian(at: 6) == nil { return nil }
 
         let startMer = meridian(at: 3)
         let endMer = meridian(at: 6)
+        let startHasMinutes = match.range(at: 2).location != NSNotFound
+        let endHasMinutes = match.range(at: 5).location != NSNotFound
+        let fullyBare = startMer == nil && endMer == nil && !startHasMinutes && !endHasMinutes
+        if fullyBare {
+            // Bare 14–16 is military (2–4 PM) only as the whole field or after "from".
+            // "Suite 14 - 2nd", "Room 13-15", "Oct 14-16", "ages 14-16" are not clocks.
+            let matched = nsText.substring(with: match.range).lowercased()
+            let isWholeField = matched == text.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            if startHourRaw > 12 || endHourRaw > 12, !isWholeField, !matched.hasPrefix("from") {
+                return nil
+            }
+            // An explicit "10 AM" elsewhere beats a bare number pair.
+            if !isWholeField, hasExplicitMeridianClock(in: nsText, outside: match.range) {
+                return nil
+            }
+        }
         var start = ClockTimeParser.applyMeridian(
             hour: startHourRaw,
             minute: startMinute,
@@ -85,6 +97,14 @@ enum TimeRangeParser {
             endMinute: end.minute,
             nsRange: match.range
         )
+    }
+
+    private static func hasExplicitMeridianClock(in text: NSString, outside range: NSRange) -> Bool {
+        guard let regex = try? NSRegularExpression(pattern: #"(?i)\b\d{1,2}(?::\d{2})?\s*(?:a|p)\.?m\b"#) else {
+            return false
+        }
+        return regex.matches(in: text as String, options: [], range: NSRange(location: 0, length: text.length))
+            .contains { NSIntersectionRange($0.range, range).length == 0 }
     }
 }
 
@@ -210,6 +230,11 @@ enum ClockTimeParser {
             pattern: #"(?i)\b(\d{1,2}):(\d{2})\b"#
         ) { match, ns in numericClock(in: match, nsText: ns, hourAt: 1, minuteAt: 2, meridianAt: nil) }
 
+        // Whole field "14" / "14:00" / "0" — Review and edit clocks, not a trailing fragment.
+        addMatches(
+            pattern: #"(?i)^\s*(\d{1,2})(?::(\d{2}))?\s*((?:a|p)\.?m\.?)?\s*$"#
+        ) { match, ns in numericClock(in: match, nsText: ns, hourAt: 1, minuteAt: 2, meridianAt: 3) }
+
         addMatches(
             pattern: #"(?i)(?:\b(?:at|from)\s+|@\s*)(one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|noon|midnight)(?:\s+o'?clock)?\s*((?:a|p)\.?m\.?)?\b"#
         ) { match, ns in spokenClock(in: match, nsText: ns, wordAt: 1, meridianAt: 2) }
@@ -222,9 +247,10 @@ enum ClockTimeParser {
             pattern: #"(?i)\b(\d{1,2})(?::(\d{2}))?\s*$"#
         ) { match, ns in
             guard match.range.location > 0 else { return nil }
-            // "March 4" is a day, not 4 o'clock.
+            // "March 4" is a day, not 4 o'clock. "6/9" is a date, not 9 o'clock.
             let prefix = ns.substring(to: match.range.location)
             if lastWordIsMonth(prefix) { return nil }
+            if prefix.hasSuffix("/") { return nil }
             return numericClock(in: match, nsText: ns, hourAt: 1, minuteAt: 2, meridianAt: nil)
         }
 
@@ -269,18 +295,28 @@ enum ClockTimeParser {
         }()
         guard hourRaw >= 0, hourRaw <= 23, minute < 60 else { return nil }
         let minuteMissing = minuteAt >= match.numberOfRanges || match.range(at: minuteAt).location == NSNotFound
-        if hourRaw > 12, minuteMissing, meridian(in: match, nsText: nsText, at: meridianAt) == nil {
-            return nil
-        }
-        if hourRaw == 0, meridian(in: match, nsText: nsText, at: meridianAt) == nil, minuteMissing {
-            return nil
-        }
         let mer = meridian(in: match, nsText: nsText, at: meridianAt)
+        if (hourRaw > 12 || hourRaw == 0), minuteMissing, mer == nil {
+            let matched = nsText.substring(with: match.range)
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .lowercased()
+            let whole = (nsText as String).trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            let isWholeField = matched == whole
+            let isNamedTime = matched.hasPrefix("at")
+                || matched.hasPrefix("from")
+                || matched.hasPrefix("around")
+                || matched.hasPrefix("@")
+            // "14" and "at 14" are 2 PM. Trailing day numbers ("2026-09-14") are not.
+            if !isWholeField, !isNamedTime {
+                return nil
+            }
+        }
         let applied = applyMeridian(hour: hourRaw, minute: minute, meridian: mer)
         return Result(hour: applied.hour, minute: applied.minute, nsRange: match.range)
     }
 
     /// Explicit am/pm or 24-hour wins. Bare 1–5 is afternoon (1 → 13:00), never 1 AM.
+    /// Bare 13–23 and 0 are military (14 → 14:00 / 2 PM, 0 → midnight). Never 14 → 2 AM.
     /// Bare 10/11 stay late morning unless a range only fits evening.
     static func applyMeridian(hour: Int, minute: Int, meridian: String?) -> (hour: Int, minute: Int) {
         let token = meridian?
@@ -360,16 +396,20 @@ enum EventExtractor {
         let fullRange = NSRange(location: 0, length: nsText.length)
         let matches = detector?.matches(in: trimmed, options: [], range: fullRange) ?? []
 
-        let dateMatches = matches.filter { $0.resultType.contains(.date) && $0.date != nil }
+        var dateMatches = matches.filter { $0.resultType.contains(.date) && $0.date != nil }
+        if let day = dayMatchForSplitClock(dateMatches, in: nsText) {
+            dateMatches = [day]
+        }
         let addresses = matches.compactMap { match -> String? in
             guard match.resultType.contains(.address) else { return nil }
             return formattedAddress(match) ?? nsText.substring(with: match.range)
         }
 
+        let timeRange = TimeRangeParser.parse(trimmed)
+        dateMatches = discardingTimeRangesReadAsDates(dateMatches, timeRange: timeRange, in: nsText)
+
         let dateRanges = dateMatches.map(\.range)
         let dateSpans = dateRanges.map { dateOnlyRange(of: $0, in: nsText) }
-
-        let timeRange = TimeRangeParser.parse(trimmed)
         if let timeRange, isSingleAppointment(dateMatches) {
             return [
                 draftFromTimeRange(
@@ -398,16 +438,17 @@ enum EventExtractor {
         }
 
         if dateMatches.isEmpty {
+            let day = namedWeekdayDate(in: trimmed) ?? slashDate(in: trimmed)
             let split = titleAndPlace(in: trimmed)
             return [
                 DraftEvent(
                     title: split.title,
-                    start: Date(),
+                    start: day ?? Date(),
                     durationMinutes: 60,
                     durationAssumed: true,
                     location: addresses.first ?? split.place,
                     sourceText: original,
-                    hasDate: mentionsRelativeDate(trimmed),
+                    hasDate: day != nil || mentionsRelativeDate(trimmed),
                     hasTime: false
                 )
             ]
@@ -435,6 +476,12 @@ enum EventExtractor {
                 start = clock.startDate(on: date)
                 hasTime = true
                 blanked.append(clock.nsRange)
+            } else if let own = ClockTimeParser.first(in: snippet) {
+                // NSDataDetector rolls a bare "10:30" to tonight once 10:30 AM has passed,
+                // and gives it today even when the thread says Saturday.
+                let day = isClockOnly(snippet) ? (namedDay(near: index, in: dateMatches, text: nsText) ?? date) : date
+                start = own.startDate(on: day)
+                hasTime = true
             }
 
             let split = titleAndPlace(
@@ -473,6 +520,50 @@ enum EventExtractor {
         return calendar.isDate(first, inSameDayAs: second)
     }
 
+    /// OCR puts "Oct 14" and "12:15 PM" on separate lines, so NSDataDetector returns
+    /// a date-only hit (noon) and a time-only hit (today). That is one appointment.
+    private static func dayMatchForSplitClock(
+        _ dates: [NSTextCheckingResult],
+        in text: NSString
+    ) -> NSTextCheckingResult? {
+        guard dates.count == 2 else { return nil }
+        let snippets = dates.map { text.substring(with: $0.range) }
+        let dayIndex: Int
+        if isDayOnly(snippets[0]), isClockOnly(snippets[1]) {
+            dayIndex = 0
+        } else if isClockOnly(snippets[0]), isDayOnly(snippets[1]) {
+            dayIndex = 1
+        } else {
+            return nil
+        }
+        let gapStart = NSMaxRange(dates[0].range)
+        let gap = text.substring(with: NSRange(location: gapStart, length: max(0, dates[1].range.location - gapStart)))
+        // Spoken "dentist Oct 14, gym at 5" is two plans; a photo line break is one card.
+        let words = gap.replacingOccurrences(of: #"(?i)\b(at|on)\b"#, with: "", options: .regularExpression)
+        guard gap.contains(where: \.isNewline) || !words.contains(where: \.isLetter) else { return nil }
+        return dates[dayIndex]
+    }
+
+    private static func isDayOnly(_ snippet: String) -> Bool {
+        ClockTimeParser.parse(snippet) == nil && TimeRangeParser.parse(snippet) == nil
+    }
+
+    private static func isClockOnly(_ snippet: String) -> Bool {
+        guard ClockTimeParser.parse(snippet) != nil || TimeRangeParser.parse(snippet) != nil else { return false }
+        let rest = snippet.replacingOccurrences(
+            of: #"(?i)\d{1,2}(?::\d{2})?\s*(?:[ap]\.?m\.?)?|\b(?:at|from|around|to|until)\b|[@\s\p{P}–]"#,
+            with: "",
+            options: .regularExpression
+        )
+        return rest.isEmpty
+    }
+
+    /// The day named by the closest date hit that is not just a clock.
+    private static func namedDay(near index: Int, in dates: [NSTextCheckingResult], text: NSString) -> Date? {
+        let named = dates.indices.filter { $0 != index && !isClockOnly(text.substring(with: dates[$0].range)) }
+        return named.min { abs($0 - index) < abs($1 - index) }.flatMap { dates[$0].date }
+    }
+
     private static func draftFromTimeRange(
         _ range: TimeRangeParser.Result,
         text: String,
@@ -481,7 +572,7 @@ enum EventExtractor {
         dateSpans: [NSRange],
         addresses: [String]
     ) -> DraftEvent {
-        let daySource = dateMatches.first?.date ?? Date()
+        let daySource = appointmentDay(from: dateMatches, in: nsText as String) ?? Date()
         let start = range.startDate(on: daySource)
         let split = titleAndPlace(
             in: remainder(
@@ -499,7 +590,7 @@ enum EventExtractor {
             durationAssumed: false,
             location: addresses.first ?? split.place,
             sourceText: text,
-            hasDate: !dateMatches.isEmpty || mentionsRelativeDate(text),
+            hasDate: !dateMatches.isEmpty || mentionsRelativeDate(text) || slashDate(in: nsText as String) != nil,
             hasTime: true
         )
     }
@@ -512,7 +603,7 @@ enum EventExtractor {
         dateSpans: [NSRange],
         addresses: [String]
     ) -> DraftEvent {
-        let daySource = dateMatches.first?.date ?? Date()
+        let daySource = appointmentDay(from: dateMatches, in: nsText as String) ?? Date()
         let start = clock.startDate(on: daySource)
         let split = titleAndPlace(
             in: remainder(
@@ -530,7 +621,7 @@ enum EventExtractor {
             durationAssumed: true,
             location: addresses.first ?? split.place,
             sourceText: text,
-            hasDate: !dateMatches.isEmpty || mentionsRelativeDate(text),
+            hasDate: !dateMatches.isEmpty || mentionsRelativeDate(text) || slashDate(in: nsText as String) != nil,
             hasTime: true
         )
     }
@@ -906,6 +997,105 @@ enum EventExtractor {
         let lowerBound = index == 0 ? 0 : NSMaxRange(dates[index - 1].range)
         let upperBound = index + 1 < dates.count ? dates[index + 1].range.location : textLength
         return range.location >= lowerBound && NSMaxRange(range) <= upperBound
+    }
+
+    /// NSDataDetector reads bare "6-9" as June 9. Drop only that pair.
+    /// Keep "tomorrow 6-9" / "friday 6-9"; "June 9" and "6/9" are not dash ranges.
+    private static func discardingTimeRangesReadAsDates(
+        _ dates: [NSTextCheckingResult],
+        timeRange: TimeRangeParser.Result?,
+        in text: NSString
+    ) -> [NSTextCheckingResult] {
+        guard let timeRange else { return dates }
+        return dates.filter { match in
+            guard NSMaxRange(match.range) <= text.length else { return false }
+            if NSIntersectionRange(match.range, timeRange.nsRange).length == 0 {
+                return true
+            }
+            let snippet = text.substring(with: match.range)
+            if CalendarCardParser.looksLikeWrittenMonthOrSlash(snippet) { return true }
+            return !CalendarCardParser.isBareNumericClockRange(snippet)
+        }
+    }
+
+    private static let weekdayDates: [(name: String, weekday: Int)] = [
+        ("sunday", 1), ("monday", 2), ("tuesday", 3), ("wednesday", 4),
+        ("thursday", 5), ("friday", 6), ("saturday", 7)
+    ]
+
+    /// Prefer an explicit month/slash date, then a named weekday, then whatever
+    /// NSDataDetector kept after dropping "6-9" → June 9.
+    /// `text` must be the same string the detector ranges were measured on.
+    private static func appointmentDay(
+        from dates: [NSTextCheckingResult],
+        in text: String,
+        calendar: Calendar = .current
+    ) -> Date? {
+        let nsText = text as NSString
+        func snippet(_ match: NSTextCheckingResult) -> String? {
+            guard NSMaxRange(match.range) <= nsText.length else { return nil }
+            return nsText.substring(with: match.range)
+        }
+        if let explicit = dates.first(where: {
+            snippet($0).map(CalendarCardParser.looksLikeWrittenMonthOrSlash) == true
+        })?.date {
+            return explicit
+        }
+        if let slash = slashDate(in: text, calendar: calendar) {
+            return slash
+        }
+        if let weekday = namedWeekdayDate(in: text, calendar: calendar) {
+            return weekday
+        }
+        return dates.first?.date
+    }
+
+    private static func namedWeekdayDate(in text: String, calendar: Calendar = .current) -> Date? {
+        let folded = text.lowercased()
+        for item in weekdayDates where folded.range(of: "\\b\(item.name)\\b", options: .regularExpression) != nil {
+            let start = calendar.startOfDay(for: Date())
+            if calendar.component(.weekday, from: start) == item.weekday {
+                return start
+            }
+            return calendar.nextDate(
+                after: start,
+                matching: DateComponents(weekday: item.weekday),
+                matchingPolicy: .nextTime
+            ) ?? start
+        }
+        return nil
+    }
+
+    /// "6/9" is June 9 (or 6 September), never 6–9 PM.
+    private static func slashDate(in text: String, calendar: Calendar = .current) -> Date? {
+        guard let regex = try? NSRegularExpression(pattern: #"\b(\d{1,2})/(\d{1,2})(?:/(\d{2,4}))?\b"#) else {
+            return nil
+        }
+        let nsText = text as NSString
+        guard let match = regex.firstMatch(
+            in: text,
+            options: [],
+            range: NSRange(location: 0, length: nsText.length)
+        ) else { return nil }
+        let first = Int(nsText.substring(with: match.range(at: 1))) ?? 0
+        let second = Int(nsText.substring(with: match.range(at: 2))) ?? 0
+        let year: Int = {
+            if match.numberOfRanges > 3, match.range(at: 3).location != NSNotFound {
+                let raw = Int(nsText.substring(with: match.range(at: 3))) ?? calendar.component(.year, from: Date())
+                return raw < 100 ? 2000 + raw : raw
+            }
+            return calendar.component(.year, from: Date())
+        }()
+        let parts: DateComponents
+        if (1...12).contains(first), (1...31).contains(second) {
+            parts = DateComponents(year: year, month: first, day: second)
+        } else if (1...12).contains(second), (1...31).contains(first) {
+            parts = DateComponents(year: year, month: second, day: first)
+        } else {
+            return nil
+        }
+        guard let date = calendar.date(from: parts) else { return nil }
+        return calendar.startOfDay(for: date)
     }
 
     private static func mentionsRelativeDate(_ text: String) -> Bool {

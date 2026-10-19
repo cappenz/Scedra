@@ -13,7 +13,8 @@ enum HomeGapRouter {
         walkMinutes: Int,
         preferTransit: Bool = false,
         minHomeMinutes: Int = 0,
-        standingBring: [String] = []
+        standingBring: [String] = [],
+        occupied: [HomeGapStop] = []
     ) async -> HomeGapSuggestion? {
         if let overlap = HomeGapLogic.overlapSuggestion(
             first: first,
@@ -91,7 +92,8 @@ enum HomeGapRouter {
             walkMinutes: walkMinutes,
             preferTransit: preferTransit,
             minHomeMinutes: minHomeMinutes,
-            standingBring: standingBring
+            standingBring: standingBring,
+            occupied: occupied
         )
         if var next = suggestion, let stop = await NearbyTransit.nearest(to: toB, excluding: fromA) {
             next.nearbyTransitLine = stop.line
@@ -160,7 +162,8 @@ enum HomeGapRouter {
                 walkMinutes: walkMinutes,
                 preferTransit: preferTransit,
                 minHomeMinutes: minHomeMinutes,
-                standingBring: standingBring
+                standingBring: standingBring,
+                occupied: resolved
             ) {
                 result.append(suggestion)
             }

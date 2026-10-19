@@ -24,10 +24,49 @@ struct PlaceAreaSplit: Equatable {
 enum PlaceSearchOriginPolicy: Equatable {
     /// "mcdonalds menlo park" — search that area only, never Home or GPS.
     case namedArea
-    /// Generic "mcdonalds" when Settings Home is set — nearest to Home.
+    /// Generic "mcdonalds" nearest to Home — when Search from is Home, or no pin.
     case home
-    /// Generic POI when Home is empty — nearest to the current pin ("closest to me").
+    /// Generic POI nearest to the current / last-known pin ("closest to me").
     case currentLocation
+}
+
+/// A Maps hit the distinctive-name picker can score without EventKit / MKMapItem.
+struct PlaceCandidate: Equatable {
+    var name: String
+    var address: String
+    var latitude: Double
+    var longitude: Double
+
+    var location: CLLocation {
+        CLLocation(latitude: latitude, longitude: longitude)
+    }
+
+    func asResolvedPlace(caption: String) -> ResolvedPlace {
+        ResolvedPlace(
+            name: name.isEmpty ? address : name,
+            address: address,
+            latitude: latitude,
+            longitude: longitude,
+            caption: caption
+        )
+    }
+}
+
+/// Where a distinctive MKLocalSearch is centered. Never a travel origin.
+enum PlaceLookupAnchor: Equatable {
+    case lastKnown
+    case home
+    case continentalUS
+}
+
+/// Ordered lookup for one query. Distinctive names search last-known, Home, and the US,
+/// then geocode — they do not stop at a nearby generic POI.
+struct PlaceLookupPlan: Equatable {
+    var queries: [String]
+    var isDistinctiveVenue: Bool
+    var prefersNamedArea: Bool
+    var searchAnchors: [PlaceLookupAnchor]
+    var geocodeAfterSearch: Bool
 }
 
 /// Ordered strategy for one location query, built before any network call so it can be tested.
@@ -41,9 +80,18 @@ struct PlaceSearchPlan: Equatable {
     /// Multi-word proper names get a much wider search and an unscoped last resort.
     var isDistinctiveVenue: Bool
 
-    /// Home wins for a generic POI when an address is set. Simulator GPS is not "closest".
-    func originPolicy(homeAddressIsSet: Bool) -> PlaceSearchOriginPolicy {
+    /// Named area still wins. Home-first for a generic POI only when Search from is
+    /// Home, or there is no current/last-known pin.
+    func originPolicy(
+        homeAddressIsSet: Bool,
+        searchFrom: PlaceSearchFrom = .currentLocation,
+        hasLocationPin: Bool = false
+    ) -> PlaceSearchOriginPolicy {
         if prefersNamedArea { return .namedArea }
+        if searchFrom == .home {
+            return homeAddressIsSet ? .home : .currentLocation
+        }
+        if hasLocationPin { return .currentLocation }
         return homeAddressIsSet ? .home : .currentLocation
     }
 }
@@ -66,12 +114,17 @@ final class PlaceResolver {
 
     private let locationProvider = LocationProvider()
 
-    /// Full-phrase search near a named area, then Home (when set), then last-known /
-    /// current pin, then a default-region search for distinctive names and addresses.
-    /// Returning nil is fine: the caller keeps the typed text and the event still saves.
-    func resolve(_ query: String) async -> ResolvedPlace? {
+    /// Full-phrase search. Distinctive venues (Westwind Community Barn) match by name
+    /// across last-known, Home, and a US-sized region, then geocode — never a nearby
+    /// generic POI. Generic chains still follow Search from / Home-first.
+    /// Existing calendar events pass `allowLiveGPS: false` so a missing fix cannot
+    /// block geocoding a street that is already on the event.
+    func resolve(_ query: String, allowLiveGPS: Bool = true) async -> ResolvedPlace? {
         let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return nil }
+        if let remembered = await resolvedRememberedPlace(matching: trimmed) {
+            return remembered
+        }
         if let saved = await resolvedSavedPlace(matching: trimmed) {
             return saved
         }
@@ -83,15 +136,14 @@ final class PlaceResolver {
 
         for phrase in phrases {
             guard await isUsablePhrase(phrase, whenShorterThan: trimmed) else { continue }
-            if let place = await anchoredPlace(matching: phrase) { return place }
-        }
-
-        // Last resort for a distinctive name only: a franchise with no location fix
-        // must not resolve to a store in another state.
-        for phrase in phrases where Self.isDistinctiveVenue(phrase) {
-            guard !Self.searchPlan(for: phrase).prefersNamedArea else { continue }
-            guard await isUsablePhrase(phrase, whenShorterThan: trimmed) else { continue }
-            if let place = await unscopedPlace(matching: phrase) { return place }
+            let plan = Self.searchPlan(for: phrase)
+            if plan.isDistinctiveVenue, !plan.prefersNamedArea {
+                if let place = await distinctivePlace(matching: phrase) { return place }
+                continue
+            }
+            if let place = await anchoredPlace(matching: phrase, allowLiveGPS: allowLiveGPS) {
+                return place
+            }
         }
         return nil
     }
@@ -139,7 +191,67 @@ final class PlaceResolver {
         return await geocodedArea(phrase) == nil
     }
 
-    private func anchoredPlace(matching phrase: String) async -> ResolvedPlace? {
+    /// Name-first lookup. Home is a search region, never a reason to keep a nearby "Community Center".
+    private func distinctivePlace(matching phrase: String) async -> ResolvedPlace? {
+        let lastKnown = locationProvider.lastKnownForSearch()
+        let home = await geocodedHome()
+        var centers: [CLLocation] = []
+        var seen = Set<String>()
+        func add(_ location: CLLocation?) {
+            guard let location else { return }
+            let key = String(format: "%.4f,%.4f", location.coordinate.latitude, location.coordinate.longitude)
+            guard seen.insert(key).inserted else { return }
+            centers.append(location)
+        }
+        add(lastKnown)
+        add(home)
+        add(Self.fallbackSearchLocation)
+
+        for query in Self.lookupQueries(for: phrase) {
+            for center in centers {
+                if let place = await nameMatchedPlace(
+                    matching: query,
+                    near: center,
+                    radius: Self.fallbackSearchRadiusMeters
+                ) {
+                    return place
+                }
+            }
+            if var place = await geocodedResolvedAddress(query, fallbackName: query) {
+                place.caption = ScedraString("Best name match")
+                return place
+            }
+        }
+        return nil
+    }
+
+    private func nameMatchedPlace(
+        matching query: String,
+        near center: CLLocation,
+        radius: CLLocationDistance
+    ) async -> ResolvedPlace? {
+        let request = MKLocalSearch.Request()
+        request.naturalLanguageQuery = query
+        request.resultTypes = [.pointOfInterest, .address]
+        request.region = Self.localSearchRegion(around: center, radius: radius)
+        do {
+            let response = try await MKLocalSearch(request: request).start()
+            let candidates = response.mapItems.compactMap(Self.candidate(from:))
+            guard let picked = Self.preferredCandidate(
+                from: candidates,
+                query: query,
+                near: center,
+                distinctive: true
+            ) else {
+                return nil
+            }
+            return picked.asResolvedPlace(caption: ScedraString("Best name match"))
+        } catch {
+            return nil
+        }
+    }
+
+    private func anchoredPlace(matching phrase: String, allowLiveGPS: Bool) async -> ResolvedPlace? {
         let plan = Self.searchPlan(for: phrase)
         let radius = plan.isDistinctiveVenue ? Self.wideSearchRadiusMeters : Self.searchRadiusMeters
         let maxDistance = plan.isDistinctiveVenue ? Self.wideMaxDistanceMeters : Self.maxDistanceMeters
@@ -173,7 +285,12 @@ final class PlaceResolver {
             return nil
         }
 
-        let policy = plan.originPolicy(homeAddressIsSet: Self.isHomeAddressSet)
+        let lastKnown = locationProvider.lastKnownForSearch()
+        let policy = plan.originPolicy(
+            homeAddressIsSet: Self.isHomeAddressSet,
+            searchFrom: PlaceSearchFrom.resolved(),
+            hasLocationPin: lastKnown != nil
+        )
         if policy == .home {
             if let home = await geocodedHome(),
                let place = await closestPlace(
@@ -190,10 +307,10 @@ final class PlaceResolver {
         }
 
         // Last-known first so a denied / slow GPS fix does not block "closest to me".
-        if let last = locationProvider.lastKnownForSearch(),
+        if let lastKnown,
            let place = await closestPlace(
                matching: plan.fullPhrase,
-               near: last,
+               near: lastKnown,
                caption: ScedraString("Nearby match"),
                radius: radius,
                maxDistance: maxDistance
@@ -202,7 +319,9 @@ final class PlaceResolver {
         }
 
         // Distinctive names skip the live-fix wait — unscoped + default region is next.
-        if !plan.isDistinctiveVenue,
+        // Existing calendar events must not wait on GPS either.
+        if allowLiveGPS,
+           !plan.isDistinctiveVenue,
            let current = await trustedUserLocation(),
            let place = await closestPlace(
                matching: plan.fullPhrase,
@@ -234,16 +353,21 @@ final class PlaceResolver {
                 return place
             }
         }
-        let hint = await searchHintLocation(allowHomeGeocode: true)
-        for candidate in Self.addressLookupCandidates(from: query) {
-            if let place = await closestPlace(
-                matching: candidate,
-                near: hint,
-                caption: ScedraString("Address"),
-                radius: Self.wideSearchRadiusMeters,
-                maxDistance: Self.fallbackSearchRadiusMeters
-            ) {
-                return place
+        let centers = Self.geocodeRegionCenters(
+            lastKnown: locationProvider.lastKnownForSearch(),
+            home: await geocodedHome()
+        )
+        for center in centers {
+            for candidate in Self.addressLookupCandidates(from: query) {
+                if let place = await closestPlace(
+                    matching: candidate,
+                    near: center,
+                    caption: ScedraString("Address"),
+                    radius: Self.wideSearchRadiusMeters,
+                    maxDistance: Self.fallbackSearchRadiusMeters
+                ) {
+                    return place
+                }
             }
         }
         return nil
@@ -268,9 +392,34 @@ final class PlaceResolver {
         return candidates
     }
 
-    /// Home, last-known pin, then the continental default. Never a travel origin.
-    static func searchHint(home: CLLocation?, lastKnown: CLLocation?) -> CLLocation {
-        home ?? lastKnown ?? fallbackSearchLocation
+    /// Search region: current/last-known over Home when Search from is Current location.
+    /// Fallback Home, then the continental default. Never a travel origin.
+    static func searchHint(
+        home: CLLocation?,
+        lastKnown: CLLocation?,
+        searchFrom: PlaceSearchFrom = .currentLocation
+    ) -> CLLocation {
+        if searchFrom == .currentLocation {
+            return lastKnown ?? home ?? fallbackSearchLocation
+        }
+        return home ?? lastKnown ?? fallbackSearchLocation
+    }
+
+    /// Last-known, then Home, then the continental default. Empty/throw on one
+    /// region retries the next — a stale GPS pin must not be the only hint.
+    static func geocodeRegionCenters(lastKnown: CLLocation?, home: CLLocation?) -> [CLLocation] {
+        var centers: [CLLocation] = []
+        var seen = Set<String>()
+        func add(_ location: CLLocation?) {
+            guard let location else { return }
+            let key = String(format: "%.4f,%.4f", location.coordinate.latitude, location.coordinate.longitude)
+            guard seen.insert(key).inserted else { return }
+            centers.append(location)
+        }
+        add(lastKnown)
+        add(home)
+        add(fallbackSearchLocation)
+        return centers
     }
 
     static func localSearchRegion(
@@ -307,13 +456,54 @@ final class PlaceResolver {
         )
     }
 
+    /// Confirmed distinctive venues (Westwind) reuse the saved pin — no second Maps roll of the dice.
+    private func resolvedRememberedPlace(matching query: String) async -> ResolvedPlace? {
+        guard !PlaceMemory.isGenericPOI(query) else { return nil }
+        guard let remembered = PlaceMemory.remembered(matchingPlaceQuery: query)
+            ?? PlaceMemory.remembered(forTitle: query)
+        else { return nil }
+        if let place = Self.resolvedPlace(fromRemembered: remembered) {
+            return place
+        }
+        if let place = await resolvedAddress(remembered.location) {
+            return ResolvedPlace(
+                name: place.name,
+                address: place.address,
+                latitude: place.latitude,
+                longitude: place.longitude,
+                caption: ScedraString("Remembered")
+            )
+        }
+        return nil
+    }
+
+    static func resolvedPlace(fromRemembered remembered: RememberedPlace) -> ResolvedPlace? {
+        guard let latitude = remembered.latitude, let longitude = remembered.longitude else {
+            return nil
+        }
+        let line = remembered.location.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !line.isEmpty else { return nil }
+        let parts = line.split(separator: "·", maxSplits: 1).map {
+            $0.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        let name = parts.first ?? line
+        let address = parts.count > 1 ? parts[1] : ""
+        return ResolvedPlace(
+            name: name,
+            address: address,
+            latitude: latitude,
+            longitude: longitude,
+            caption: ScedraString("Remembered")
+        )
+    }
+
     func geocodedAddress(_ address: String) async -> CLLocation? {
         let trimmed = address.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return nil }
         return try? await geocodeMarks(trimmed).first?.location
     }
 
-    /// Origin for Review drive estimates: Settings home when set, else current location.
+    /// Origin for Review drive estimates: current/last-known when that setting is on.
     func travelOrigin() async -> CLLocation? {
         await resolvedTravelOrigin()?.location
     }
@@ -325,18 +515,43 @@ final class PlaceResolver {
 
     func resolvedTravelOrigin() async -> TravelOriginPin? {
         let home = await geocodedHome()
-        // Always read Core Location (When In Use). Review still prefers Home when it
-        // geocodes; a Simulator Apple Park fix is valid when Home is empty.
-        let current = await locationProvider.currentFix()
+        let searchFrom = PlaceSearchFrom.resolved()
+        let lastKnown = locationProvider.lastKnownForSearch()
+        // Always read Core Location (When In Use) when we may route from here.
+        let current = searchFrom == .currentLocation
+            ? await locationProvider.currentFix()
+            : (home == nil ? await locationProvider.currentFix() : nil)
         let trustCurrent = TravelEstimator.shouldTrustCurrentFix(
             homeAddressIsSet: home != nil,
-            isSimulator: false
+            isSimulator: false,
+            searchFrom: searchFrom
         )
         guard let pin = TravelEstimator.preferredOrigin(
             current: current,
             home: home,
-            currentIsTrusted: trustCurrent && current != nil
+            currentIsTrusted: trustCurrent && current != nil,
+            lastKnown: lastKnown,
+            searchFrom: searchFrom
         ) else { return nil }
+        return travelOriginPin(pin, home: home)
+    }
+
+    /// Home / last-known region for calendar backfill. Does not wait on a live GPS fix.
+    func resolvedSearchOrigin() async -> TravelOriginPin? {
+        let home = await geocodedHome()
+        let lastKnown = locationProvider.lastKnownForSearch()
+        let searchFrom = PlaceSearchFrom.resolved()
+        guard let pin = TravelEstimator.preferredOrigin(
+            current: nil,
+            home: home,
+            currentIsTrusted: false,
+            lastKnown: lastKnown,
+            searchFrom: searchFrom
+        ) else { return nil }
+        return travelOriginPin(pin, home: home)
+    }
+
+    private func travelOriginPin(_ pin: CLLocation, home: CLLocation?) -> TravelOriginPin {
         let fromHome = home.map {
             $0.coordinate.latitude == pin.coordinate.latitude
                 && $0.coordinate.longitude == pin.coordinate.longitude
@@ -356,9 +571,19 @@ final class PlaceResolver {
         return !address.isEmpty
     }
 
-    /// Testable origin policy: named area wins, else Home when set, else the current pin.
-    static func originPolicy(for query: String, homeAddressIsSet: Bool) -> PlaceSearchOriginPolicy {
-        searchPlan(for: query).originPolicy(homeAddressIsSet: homeAddressIsSet)
+    /// Testable origin policy: named area wins, else Home when that setting is on
+    /// or there is no pin, else the current pin.
+    static func originPolicy(
+        for query: String,
+        homeAddressIsSet: Bool,
+        searchFrom: PlaceSearchFrom = .currentLocation,
+        hasLocationPin: Bool = false
+    ) -> PlaceSearchOriginPolicy {
+        searchPlan(for: query).originPolicy(
+            homeAddressIsSet: homeAddressIsSet,
+            searchFrom: searchFrom,
+            hasLocationPin: hasLocationPin
+        )
     }
 
     static func searchPlan(for query: String) -> PlaceSearchPlan {
@@ -371,6 +596,89 @@ final class PlaceResolver {
             isDistinctiveVenue: isDistinctiveVenue(trimmed)
         )
     }
+
+    /// Full query, split-brand repair, then filler stripped. Distinctive names keep
+    /// "community barn" — only articles / prepositions drop.
+    static func lookupQueries(for query: String) -> [String] {
+        let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return [] }
+        var queries: [String] = []
+        var seen = Set<String>()
+        func add(_ value: String) {
+            let next = value.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !next.isEmpty, seen.insert(folded(next)).inserted else { return }
+            queries.append(next)
+        }
+        add(trimmed)
+        add(joinSplitBrandTokens(trimmed))
+        add(stripFillerWords(trimmed))
+        add(stripFillerWords(joinSplitBrandTokens(trimmed)))
+        return queries
+    }
+
+    static func stripFillerWords(_ query: String) -> String {
+        query
+            .split { $0.isWhitespace }
+            .filter { !lookupFiller.contains(folded(String($0)).trimmingCharacters(in: .punctuationCharacters)) }
+            .joined(separator: " ")
+    }
+
+    /// Distinctive names always try last-known, Home, and the US, then geocode.
+    /// Generic "coffee" / McDonald's keep Home-first when Search from is Home.
+    static func lookupPlan(
+        for query: String,
+        searchFrom: PlaceSearchFrom = .currentLocation,
+        homeAddressIsSet: Bool,
+        hasLocationPin: Bool = false
+    ) -> PlaceLookupPlan {
+        let search = searchPlan(for: query)
+        let queries = lookupQueries(for: query)
+        if search.prefersNamedArea {
+            return PlaceLookupPlan(
+                queries: queries,
+                isDistinctiveVenue: search.isDistinctiveVenue,
+                prefersNamedArea: true,
+                searchAnchors: [],
+                geocodeAfterSearch: false
+            )
+        }
+        if search.isDistinctiveVenue {
+            var anchors: [PlaceLookupAnchor] = []
+            if hasLocationPin { anchors.append(.lastKnown) }
+            if homeAddressIsSet { anchors.append(.home) }
+            anchors.append(.continentalUS)
+            return PlaceLookupPlan(
+                queries: queries,
+                isDistinctiveVenue: true,
+                prefersNamedArea: false,
+                searchAnchors: anchors,
+                geocodeAfterSearch: true
+            )
+        }
+        let policy = search.originPolicy(
+            homeAddressIsSet: homeAddressIsSet,
+            searchFrom: searchFrom,
+            hasLocationPin: hasLocationPin
+        )
+        let anchors: [PlaceLookupAnchor]
+        switch policy {
+        case .namedArea:
+            anchors = []
+        case .home:
+            anchors = homeAddressIsSet ? [.home] : (hasLocationPin ? [.lastKnown] : [])
+        case .currentLocation:
+            anchors = hasLocationPin ? [.lastKnown] : (homeAddressIsSet ? [.home] : [])
+        }
+        return PlaceLookupPlan(
+            queries: queries,
+            isDistinctiveVenue: false,
+            prefersNamedArea: false,
+            searchAnchors: anchors,
+            geocodeAfterSearch: false
+        )
+    }
+
+    static let distinctiveMatchMinimum = 150
 
     /// "mcdonalds menlo park" and "mcdonalds in menlo park" name an area.
     /// "westwind community barn" only *looks* like it does because of the word-count heuristic.
@@ -459,6 +767,71 @@ final class PlaceResolver {
             .0
     }
 
+    static func candidate(from item: MKMapItem) -> PlaceCandidate? {
+        let coordinate = item.placemark.coordinate
+        guard CLLocationCoordinate2DIsValid(coordinate) else { return nil }
+        let name = item.name?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let address = shortAddress(item.placemark)
+        guard !name.isEmpty || !address.isEmpty else { return nil }
+        return PlaceCandidate(
+            name: name,
+            address: address,
+            latitude: coordinate.latitude,
+            longitude: coordinate.longitude
+        )
+    }
+
+    /// Distinctive: best name match, even if a generic POI sits closer to Home.
+    /// Generic: nearest within the usual radius.
+    static func preferredCandidate(
+        from items: [PlaceCandidate],
+        query: String,
+        near center: CLLocation?,
+        distinctive: Bool
+    ) -> PlaceCandidate? {
+        if distinctive {
+            let scored = items.compactMap { item -> (PlaceCandidate, Int)? in
+                let score = distinctiveMatchScore(query: query, name: item.name, address: item.address)
+                guard score >= distinctiveMatchMinimum else { return nil }
+                return (item, score)
+            }
+            return scored.max { lhs, rhs in
+                if lhs.1 != rhs.1 { return lhs.1 < rhs.1 }
+                guard let center else { return false }
+                return lhs.0.location.distance(from: center) > rhs.0.location.distance(from: center)
+            }?.0
+        }
+        guard let center else { return items.first }
+        return items.min { lhs, rhs in
+            lhs.location.distance(from: center) < rhs.location.distance(from: center)
+        }
+    }
+
+    static func distinctiveMatchScore(query: String, name: String, address: String = "") -> Int {
+        let q = significantTokens(query)
+        guard !q.isEmpty else { return 0 }
+        let foldedName = folded(name)
+        let foldedQuery = folded(query)
+        if foldedName == foldedQuery { return 1000 }
+        if foldedName.contains(foldedQuery) { return 800 + q.count * 10 }
+        let hay = significantTokens(name) + significantTokens(address)
+        let overlap = q.filter { token in
+            hay.contains { candidate in
+                candidate == token || candidate.hasPrefix(token) || token.hasPrefix(candidate)
+            }
+        }
+        if overlap.count == q.count { return 600 + overlap.count * 10 }
+        if overlap.count >= 2 { return 200 + overlap.count * 10 }
+        if let first = q.first, first.count >= 5, overlap.contains(first) { return 150 }
+        return 0
+    }
+
+    static func significantTokens(_ text: String) -> [String] {
+        text.split { $0.isWhitespace }
+            .map { folded(String($0)).trimmingCharacters(in: .punctuationCharacters) }
+            .filter { !$0.isEmpty && !lookupFiller.contains($0) }
+    }
+
     /// True when the string already looks like a street address or a resolved "Name · Address".
     static func isSpecificAddress(_ text: String) -> Bool {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -477,13 +850,59 @@ final class PlaceResolver {
         return trimmed.range(of: #"\b\d{1,6}\s+\p{L}"#, options: .regularExpression) != nil
     }
 
+    /// Street-like span inside a longer notes line ("Meet at 27210 Altamont Rd, Los Altos Hills").
+    static func addressInText(_ text: String) -> String? {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        let nsText = trimmed as NSString
+        let full = NSRange(location: 0, length: nsText.length)
+        let detector = try? NSDataDetector(types: NSTextCheckingResult.CheckingType.address.rawValue)
+        if let match = detector?.firstMatch(in: trimmed, options: [], range: full),
+           match.resultType.contains(.address) {
+            let snippet = nsText.substring(with: match.range)
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            if isSpecificAddress(snippet) { return snippet }
+        }
+        if let regex = try? NSRegularExpression(pattern: #"\b\d{1,6}\s+\p{L}[^,\n]{1,}(?:,\s*[^,\n]+)*"#),
+           let match = regex.firstMatch(in: trimmed, options: [], range: full) {
+            let snippet = nsText.substring(with: match.range)
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            if isSpecificAddress(snippet) { return snippet }
+        }
+        if isSpecificAddress(trimmed) { return trimmed }
+        return nil
+    }
+
+    private static let homePinLock = NSLock()
+    private static var cachedHomePin: (address: String, location: CLLocation?)?
+
     private func geocodedHome() async -> CLLocation? {
         let address = UserDefaults.standard.string(forKey: Self.homeAddressKey)?
             .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        return await geocodedAddress(address)
+        guard !address.isEmpty else { return nil }
+        Self.homePinLock.lock()
+        if Self.cachedHomePin?.address == address {
+            let cached = Self.cachedHomePin?.location
+            Self.homePinLock.unlock()
+            return cached
+        }
+        Self.homePinLock.unlock()
+        // Home itself uses the US region then unbounded so a bad last-known
+        // cannot recurse through geocodeMarks → geocodedHome.
+        let location = try? await geocodeMarks(
+            address,
+            centers: [Self.fallbackSearchLocation]
+        ).first?.location
+        Self.homePinLock.lock()
+        Self.cachedHomePin = (address, location)
+        Self.homePinLock.unlock()
+        return location
     }
 
     private static let articles: Set<String> = ["a", "an", "the"]
+    private static let lookupFiller: Set<String> = [
+        "a", "an", "the", "at", "in", "near", "around", "by", "on", "to", "from", "and"
+    ]
 
     private func geocodedArea(_ area: String) async -> CLLocation? {
         do {
@@ -495,20 +914,37 @@ final class PlaceResolver {
         }
     }
 
-    /// Region hint first so locale / no-GPS does not empty the geocoder; then unbounded.
-    private func geocodeMarks(_ address: String) async throws -> [CLPlacemark] {
+    /// Last-known, then Home, then the US region, then unbounded. A previous empty
+    /// or thrown result (wrong GPS region) retries instead of giving up.
+    private func geocodeMarks(
+        _ address: String,
+        centers: [CLLocation]? = nil
+    ) async throws -> [CLPlacemark] {
         let trimmed = address.trimmingCharacters(in: .whitespacesAndNewlines)
-        let hint = await searchHintLocation(allowHomeGeocode: false)
-        let region = CLCircularRegion(
-            center: hint.coordinate,
-            radius: Self.geocodeHintRadiusMeters,
-            identifier: "scedra.geocode"
-        )
-        do {
-            let marks = try await CLGeocoder().geocodeAddressString(trimmed, in: region)
-            if !marks.isEmpty { return marks }
-        } catch {
-            // Unbounded retry below.
+        let hints: [CLLocation]
+        if let centers {
+            hints = centers
+        } else {
+            hints = Self.geocodeRegionCenters(
+                lastKnown: locationProvider.lastKnownForSearch(),
+                home: await geocodedHome()
+            )
+        }
+        var seen = Set<String>()
+        for hint in hints {
+            let key = String(format: "%.4f,%.4f", hint.coordinate.latitude, hint.coordinate.longitude)
+            guard seen.insert(key).inserted else { continue }
+            let region = CLCircularRegion(
+                center: hint.coordinate,
+                radius: Self.geocodeHintRadiusMeters,
+                identifier: "scedra.geocode"
+            )
+            do {
+                let marks = try await CLGeocoder().geocodeAddressString(trimmed, in: region)
+                if !marks.isEmpty { return marks }
+            } catch {
+                continue
+            }
         }
         return try await CLGeocoder().geocodeAddressString(trimmed)
     }
@@ -535,7 +971,11 @@ final class PlaceResolver {
     /// Does not wait for a live GPS authorization / fix.
     private func searchHintLocation(allowHomeGeocode: Bool) async -> CLLocation {
         let home = allowHomeGeocode ? await geocodedHome() : nil
-        return Self.searchHint(home: home, lastKnown: locationProvider.lastKnownForSearch())
+        return Self.searchHint(
+            home: home,
+            lastKnown: locationProvider.lastKnownForSearch(),
+            searchFrom: PlaceSearchFrom.resolved()
+        )
     }
 
     /// City/neighborhood names match locality (or equal name). Rejects stray POI hits like "foods".

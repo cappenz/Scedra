@@ -36,6 +36,7 @@ Secrets.xcconfig
 
 # Local build / probe junk (do not commit)
 .probe_tmp/
+.harness/
 .sketch_tmp/
 *.sketch
 sketch/

@@ -1,3 +1,4 @@
+import CoreLocation
 import XCTest
 @testable import Scedra
 
@@ -402,16 +403,42 @@ final class ScedraPlaceTests: XCTestCase {
         )
         XCTAssertTrue(PlaceResolver.isSpecificAddress("1 Apple Park Way, Cupertino, CA"))
         XCTAssertTrue(PlaceResolver.isSpecificAddress("McDonald's · 165 University Ave"))
+        let snippet = PlaceResolver.addressInText(
+            "Meet at 27210 Altamont Rd, Los Altos Hills before 9"
+        )
+        XCTAssertTrue(snippet?.contains("27210") == true, snippet ?? "nil")
+        XCTAssertTrue(snippet?.localizedCaseInsensitiveContains("altamont") == true, snippet ?? "nil")
+        XCTAssertTrue(PlaceResolver.isSpecificAddress("27210 Altamont Rd, Los Altos Hills"))
+    }
+
+    func testGeocodeRetriesHomeThenUSAfterLastKnown() {
+        let last = CLLocation(latitude: 51.5074, longitude: -0.1278)
+        let home = CLLocation(latitude: 37.4419, longitude: -122.1430)
+        let centers = PlaceResolver.geocodeRegionCenters(lastKnown: last, home: home)
+        XCTAssertEqual(centers.count, 3)
+        XCTAssertEqual(centers[0].coordinate.latitude, last.coordinate.latitude, accuracy: 0.0001)
+        XCTAssertEqual(centers[1].coordinate.latitude, home.coordinate.latitude, accuracy: 0.0001)
+        XCTAssertTrue(PlaceResolver.isFallbackSearchLocation(centers[2]))
+
+        let afterLastKnownFails = PlaceResolver.geocodeRegionCenters(lastKnown: nil, home: home)
+        XCTAssertEqual(afterLastKnownFails[0].coordinate.latitude, home.coordinate.latitude, accuracy: 0.0001)
+        XCTAssertTrue(PlaceResolver.isFallbackSearchLocation(afterLastKnownFails[1]))
     }
 
     func testSearchHintNeverLeavesLocalSearchWithoutARegionCenter() {
         let home = CLLocation(latitude: 37.4419, longitude: -122.1430)
         let last = CLLocation(latitude: 37.3349, longitude: -122.0090)
         XCTAssertEqual(
-            PlaceResolver.searchHint(home: home, lastKnown: last).coordinate.latitude,
+            PlaceResolver.searchHint(home: home, lastKnown: last, searchFrom: .home).coordinate.latitude,
             home.coordinate.latitude,
             accuracy: 0.0001,
-            "Home wins over last-known for a search region"
+            "Home wins over last-known when Search from is Home"
+        )
+        XCTAssertEqual(
+            PlaceResolver.searchHint(home: home, lastKnown: last, searchFrom: .currentLocation).coordinate.latitude,
+            last.coordinate.latitude,
+            accuracy: 0.0001,
+            "current/last-known wins over Home when Search from is Current location"
         )
         XCTAssertEqual(
             PlaceResolver.searchHint(home: nil, lastKnown: last).coordinate.latitude,
@@ -429,5 +456,183 @@ final class ScedraPlaceTests: XCTestCase {
         )
         XCTAssertGreaterThan(region.span.latitudeDelta, 0)
         XCTAssertGreaterThan(region.span.longitudeDelta, 0)
+    }
+
+    @MainActor
+    func testTravelBackfillEstimatesNonScedraEventWithAPlace() async {
+        let start = Date().addingTimeInterval(3_600)
+        let end = start.addingTimeInterval(3_600)
+        let item = TodayItem(
+            id: "apple-calendar-dentist",
+            title: "Dentist",
+            start: start,
+            end: end,
+            isAllDay: false,
+            location: "Stanford Hospital",
+            notes: "Added in Apple Calendar",
+            latitude: 37.43,
+            longitude: -122.17
+        )
+        XCTAssertFalse(item.savedInfo.isScedraEvent, "no Scedra marker — still estimate")
+        XCTAssertFalse(CalendarTravelBackfill.skipsMissingScedraIdentifier(item))
+        XCTAssertTrue(CalendarTravelBackfill.shouldEstimate(item))
+        XCTAssertEqual(CalendarTravelBackfill.destinationQuery(for: item), "Stanford Hospital")
+
+        let origin = CLLocation(latitude: 37.4419, longitude: -122.1430)
+        let canned = TravelEstimator.estimate(
+            minutes: 18,
+            mode: .drive,
+            start: start,
+            bufferMinutes: 5,
+            returnMinutes: 19
+        )
+        var estimatorCalls = 0
+        var written: TravelEstimate?
+        await CalendarTravelBackfill.fill(
+            item,
+            origin: origin,
+            fromHome: false,
+            mode: .drive,
+            bufferMinutes: 5,
+            resolve: { _ in
+                XCTFail("structured location is already a pin")
+                return nil
+            },
+            estimate: { _, latitude, longitude, _, _, _, _, _ in
+                estimatorCalls += 1
+                XCTAssertEqual(latitude, 37.43, accuracy: 0.0001)
+                XCTAssertEqual(longitude, -122.17, accuracy: 0.0001)
+                return canned
+            },
+            write: { _, travel, _, _, _ in
+                written = travel
+            }
+        )
+        XCTAssertEqual(estimatorCalls, 1)
+        XCTAssertEqual(written?.minutes, 18)
+    }
+
+    func testGenericPOIUsesCurrentPinWhenSearchFromIsCurrent() {
+        XCTAssertEqual(
+            PlaceResolver.originPolicy(
+                for: "mcdonalds",
+                homeAddressIsSet: true,
+                searchFrom: .currentLocation,
+                hasLocationPin: true
+            ),
+            .currentLocation
+        )
+        XCTAssertEqual(
+            PlaceResolver.originPolicy(
+                for: "mcdonalds",
+                homeAddressIsSet: true,
+                searchFrom: .home,
+                hasLocationPin: true
+            ),
+            .home
+        )
+        XCTAssertEqual(
+            PlaceResolver.originPolicy(
+                for: "mcdonalds",
+                homeAddressIsSet: true,
+                searchFrom: .currentLocation,
+                hasLocationPin: false
+            ),
+            .home,
+            "no pin — Home-first for a generic POI"
+        )
+        XCTAssertEqual(
+            PlaceResolver.originPolicy(
+                for: "mcdonalds menlo park",
+                homeAddressIsSet: true,
+                searchFrom: .currentLocation,
+                hasLocationPin: true
+            ),
+            .namedArea,
+            "a named area still wins"
+        )
+    }
+
+    func testDistinctiveLookupPlanDoesNotStopAtHome() {
+        let westwind = PlaceResolver.lookupPlan(
+            for: "Westwind Community Barn",
+            searchFrom: .home,
+            homeAddressIsSet: true,
+            hasLocationPin: true
+        )
+        XCTAssertTrue(westwind.isDistinctiveVenue)
+        XCTAssertFalse(westwind.prefersNamedArea)
+        XCTAssertEqual(westwind.searchAnchors, [.lastKnown, .home, .continentalUS])
+        XCTAssertTrue(westwind.geocodeAfterSearch)
+        XCTAssertEqual(westwind.queries.first, "Westwind Community Barn")
+        XCTAssertTrue(PlaceResolver.lookupQueries(for: "the Westwind Community Barn").contains("Westwind Community Barn"))
+
+        let coffee = PlaceResolver.lookupPlan(
+            for: "coffee",
+            searchFrom: .home,
+            homeAddressIsSet: true,
+            hasLocationPin: true
+        )
+        XCTAssertFalse(coffee.isDistinctiveVenue)
+        XCTAssertEqual(coffee.searchAnchors, [.home], "generic coffee stays Home-first")
+        XCTAssertFalse(coffee.geocodeAfterSearch)
+
+        let mcdonalds = PlaceResolver.lookupPlan(
+            for: "mcdonalds",
+            searchFrom: .home,
+            homeAddressIsSet: true,
+            hasLocationPin: true
+        )
+        XCTAssertEqual(mcdonalds.searchAnchors, [.home])
+    }
+
+    func testNamedVenueWinsOverCloserGenericPOI() {
+        let home = CLLocation(latitude: 37.4419, longitude: -122.1430)
+        let generic = PlaceCandidate(
+            name: "Los Altos Community Center",
+            address: "1 Main St",
+            latitude: 37.4419,
+            longitude: -122.1430
+        )
+        let westwind = PlaceCandidate(
+            name: "Westwind Community Barn",
+            address: "27210 Altamont Rd, Los Altos Hills",
+            latitude: 37.3576,
+            longitude: -122.1503
+        )
+        let picked = PlaceResolver.preferredCandidate(
+            from: [generic, westwind],
+            query: "Westwind Community Barn",
+            near: home,
+            distinctive: true
+        )
+        XCTAssertEqual(picked?.name, "Westwind Community Barn")
+        XCTAssertEqual(picked?.latitude ?? 0, 37.3576, accuracy: 0.0001)
+
+        let genericOnly = PlaceResolver.preferredCandidate(
+            from: [generic],
+            query: "Westwind Community Barn",
+            near: home,
+            distinctive: true
+        )
+        XCTAssertNil(genericOnly, "a nearby Community Center must not steal a named venue")
+    }
+
+    func testRememberedWestwindReusesThePinWithoutMaps() throws {
+        PlaceMemory.resetForTests()
+        defer { PlaceMemory.resetForTests() }
+
+        PlaceMemory.remember(
+            title: "Westwind Community Barn",
+            location: "Westwind Community Barn · 27210 Altamont Rd, Los Altos Hills",
+            latitude: 37.3576,
+            longitude: -122.1503
+        )
+        let remembered = PlaceMemory.remembered(matchingPlaceQuery: "Westwind Community Barn")
+        XCTAssertEqual(remembered?.latitude, 37.3576)
+        let place = PlaceResolver.resolvedPlace(fromRemembered: try XCTUnwrap(remembered))
+        XCTAssertEqual(place?.caption, ScedraString("Remembered"))
+        XCTAssertEqual(place?.latitude ?? 0, 37.3576, accuracy: 0.0001)
+        XCTAssertTrue(place?.address.contains("27210") == true, place?.address ?? "")
     }
 }

@@ -12,7 +12,7 @@ final class ScedraTimelineTests: XCTestCase {
         for: cal.date(from: DateComponents(year: 2026, month: 6, day: 10))!
     )
     /// 60pt hours make the expected offsets readable: 1 minute == 1 point.
-    private let metrics = DayTimelineMetrics(hourHeight: 60, minimumBlockHeight: 20, columnSpacing: 4)
+    private let metrics = DayTimelineMetrics(hourHeight: 60, minimumBlockHeight: 2, columnSpacing: 4)
 
     private func time(_ hour: Int, _ minute: Int = 0) -> Date {
         dayStart.addingTimeInterval(TimeInterval(hour * 3600 + minute * 60))
@@ -42,18 +42,7 @@ final class ScedraTimelineTests: XCTestCase {
     func testDurationConvertsToProportionalHeight() {
         XCTAssertEqual(metrics.height(forSeconds: 3600), 60, accuracy: 0.01)
         XCTAssertEqual(metrics.height(forSeconds: 90 * 60), 90, accuracy: 0.01)
-        XCTAssertEqual(
-            metrics.height(forSeconds: 10 * 60, contentMinimum: 68),
-            68,
-            accuracy: 0.01,
-            "a short span still grows to hold its title, time, and location"
-        )
-        XCTAssertEqual(
-            metrics.height(forSeconds: 90 * 60, contentMinimum: 68),
-            90,
-            accuracy: 0.01,
-            "content minimum must not shrink a longer appointment"
-        )
+        XCTAssertEqual(metrics.height(forSeconds: 10 * 60), 10, accuracy: 0.01)
     }
 
     func testThreeHourEveningEventIsThreeHoursTall() throws {
@@ -65,33 +54,124 @@ final class ScedraTimelineTests: XCTestCase {
         XCTAssertFalse(dinner.continuesAfterDay)
     }
 
-    // MARK: - Minimum height
+    // MARK: - Exact start and end
 
-    func testVeryShortEventGetsMinimumHeight() throws {
-        let placed = blocks([span("checkin", 9, 0, 9, 10)])
-        let checkin = try layout("checkin", in: placed)
-        XCTAssertEqual(checkin.height, metrics.minimumBlockHeight, accuracy: 0.01)
-        XCTAssertEqual(checkin.top, 540, accuracy: 0.01, "the minimum height must not move the start time")
-    }
-
-    func testShortEventStaysLegibleWithTheShippingMetrics() {
+    /// The screenshot: "Drive home 12:30–12:50" was drawn reaching past 1 PM.
+    func testTwentyMinuteDriveEndsAtItsEndTimeOnTheShippingGrid() throws {
         let standard = DayTimelineMetrics.standard
-        let fifteenMinutes = standard.height(forSeconds: 15 * 60)
-        XCTAssertEqual(fifteenMinutes, standard.minimumBlockHeight, accuracy: 0.01)
-        XCTAssertGreaterThanOrEqual(fifteenMinutes, 28, "a 15-minute event must stay tappable")
+        let placed = DayTimelineLayout.blocks(
+            for: [span("drive", 12, 30, 12, 50)],
+            dayStart: dayStart,
+            metrics: standard
+        )
+        let drive = try layout("drive", in: placed)
+        let perMinute = standard.hourHeight / 60
+        XCTAssertEqual(drive.top, standard.offset(for: time(12, 30), dayStart: dayStart), accuracy: 0.01)
+        XCTAssertEqual(drive.top, 750 * perMinute, accuracy: 0.01)
+        XCTAssertEqual(drive.height, 20 * perMinute, accuracy: 0.01, "12:30–12:50 is 20 minutes tall")
+        XCTAssertEqual(drive.bottom, standard.offset(for: time(12, 50), dayStart: dayStart), accuracy: 0.01)
+        XCTAssertLessThan(drive.bottom, standard.offset(for: time(13), dayStart: dayStart) - 9 * perMinute)
     }
 
-    func testZeroLengthEventStillGetsABlock() throws {
+    /// The screenshot cluster: 3:00–4:00, 4:00–4:21, 4:20–5:20, 5:20–5:49.
+    /// 4:00–4:21 must read as about a third of an hour, not a full hour row.
+    func testAfternoonClusterKeepsExactStartAndEndOnTheShippingGrid() throws {
+        let standard = DayTimelineMetrics.standard
+        let placed = DayTimelineLayout.blocks(
+            for: [
+                span("target", 15, 0, 16, 0),
+                span("drive", 16, 0, 16, 21),
+                span("mart", 16, 20, 17, 20),
+                span("home", 17, 20, 17, 49)
+            ],
+            dayStart: dayStart,
+            metrics: standard
+        )
+        let target = try layout("target", in: placed)
+        let drive = try layout("drive", in: placed)
+        let mart = try layout("mart", in: placed)
+        let home = try layout("home", in: placed)
+        let perMinute = standard.hourHeight / 60
+
+        XCTAssertEqual(target.top, standard.offset(for: time(15), dayStart: dayStart), accuracy: 0.01)
+        XCTAssertEqual(target.height, standard.hourHeight, accuracy: 0.01)
+        XCTAssertEqual(target.bottom, standard.offset(for: time(16), dayStart: dayStart), accuracy: 0.01)
+
+        XCTAssertEqual(drive.top, standard.offset(for: time(16), dayStart: dayStart), accuracy: 0.01)
+        XCTAssertEqual(drive.height, 21 * perMinute, accuracy: 0.01)
+        XCTAssertEqual(drive.bottom, standard.offset(for: time(16, 21), dayStart: dayStart), accuracy: 0.01)
+        XCTAssertEqual(
+            drive.height / standard.hourHeight,
+            21.0 / 60.0,
+            accuracy: 0.001,
+            "4:00–4:21 must be ~1/3 of an hour row"
+        )
+        XCTAssertLessThan(drive.bottom, standard.offset(for: time(16, 40), dayStart: dayStart))
+
+        XCTAssertEqual(mart.top, standard.offset(for: time(16, 20), dayStart: dayStart), accuracy: 0.01)
+        XCTAssertEqual(mart.height, 60 * perMinute, accuracy: 0.01)
+        XCTAssertEqual(home.top, standard.offset(for: time(17, 20), dayStart: dayStart), accuracy: 0.01)
+        XCTAssertEqual(home.height, 29 * perMinute, accuracy: 0.01)
+        XCTAssertEqual(home.bottom, standard.offset(for: time(17, 49), dayStart: dayStart), accuracy: 0.01)
+        XCTAssertEqual(drive.columnCount, 2, "4:00–4:21 overlaps 4:20–5:20; columns keep each height")
+        XCTAssertEqual(try layout("drive", in: placed).height, 21 * perMinute, accuracy: 0.01)
+        XCTAssertEqual(try layout("mart", in: placed).height, standard.hourHeight, accuracy: 0.01)
+    }
+
+    func testHourLongEventIsExactlyOneHourOnTheShippingGrid() throws {
+        let standard = DayTimelineMetrics.standard
+        let placed = DayTimelineLayout.blocks(
+            for: [span("boba", 10, 15, 11, 15)],
+            dayStart: dayStart,
+            metrics: standard
+        )
+        let boba = try layout("boba", in: placed)
+        XCTAssertEqual(boba.top, standard.offset(for: time(10, 15), dayStart: dayStart), accuracy: 0.01)
+        XCTAssertEqual(boba.height, standard.hourHeight, accuracy: 0.01)
+        XCTAssertEqual(boba.bottom, standard.offset(for: time(11, 15), dayStart: dayStart), accuracy: 0.01)
+    }
+
+    func testShortEventsAreNotStretchedToAMinimumHeight() throws {
+        let placed = blocks([
+            span("checkin", 9, 0, 9, 10),
+            span("drive", 11, 15, 11, 33),
+            span("pickup", 14, 0, 14, 15)
+        ])
+        XCTAssertEqual(try layout("checkin", in: placed).height, 10, accuracy: 0.01)
+        XCTAssertEqual(try layout("checkin", in: placed).top, 540, accuracy: 0.01)
+        XCTAssertEqual(try layout("drive", in: placed).height, 18, accuracy: 0.01)
+        XCTAssertEqual(try layout("pickup", in: placed).height, 15, accuracy: 0.01)
+    }
+
+    func testBackToBackShortBlocksTouchWithoutOverlapping() throws {
+        let placed = blocks([
+            span("drive", 11, 15, 11, 30),
+            span("walmart", 11, 30, 12, 30),
+            span("home", 12, 30, 12, 50)
+        ])
+        let drive = try layout("drive", in: placed)
+        let walmart = try layout("walmart", in: placed)
+        let home = try layout("home", in: placed)
+        XCTAssertEqual(drive.bottom, walmart.top, accuracy: 0.01)
+        XCTAssertEqual(walmart.bottom, home.top, accuracy: 0.01)
+        XCTAssertEqual(home.bottom, 770, accuracy: 0.01)
+        for block in [drive, walmart, home] {
+            XCTAssertEqual(block.columnCount, 1)
+        }
+    }
+
+    func testZeroLengthEventStillGetsAVisibleSliver() throws {
         let placed = blocks([span("ping", 14, 0, 14, 0)])
         let ping = try layout("ping", in: placed)
         XCTAssertEqual(ping.height, metrics.minimumBlockHeight, accuracy: 0.01)
+        XCTAssertEqual(ping.top, 840, accuracy: 0.01)
+        XCTAssertLessThanOrEqual(DayTimelineMetrics.standard.minimumBlockHeight, 2, "the floor is for pings, not real events")
     }
 
-    func testMinimumHeightBlockNearMidnightStaysInsideTheGrid() throws {
-        let placed = blocks([span("late", 23, 55, 23, 58)])
+    func testFloorHeightBlockNearMidnightStaysInsideTheGrid() throws {
+        let placed = blocks([span("late", 23, 59, 23, 59)])
         let late = try layout("late", in: placed)
         XCTAssertLessThanOrEqual(late.bottom, metrics.totalHeight + 0.01, "a block must not hang off the bottom")
-        XCTAssertEqual(late.height, metrics.minimumBlockHeight, accuracy: 0.01)
     }
 
     // MARK: - Overlap clustering and columns
@@ -133,6 +213,33 @@ final class ScedraTimelineTests: XCTestCase {
         XCTAssertEqual(dentist.xOffset(inLaneWidth: 300), 0, accuracy: 0.01)
         XCTAssertEqual(standup.xOffset(inLaneWidth: 300), 150, accuracy: 0.01)
         XCTAssertEqual(standup.width(inLaneWidth: 300, spacing: 4), 146, accuracy: 0.01)
+        XCTAssertEqual(dentist.top, 540, accuracy: 0.01)
+        XCTAssertEqual(dentist.height, 60, accuracy: 0.01)
+        XCTAssertEqual(standup.top, 570, accuracy: 0.01)
+        XCTAssertEqual(standup.height, 60, accuracy: 0.01)
+    }
+
+    /// The screenshot's 11 AM pile-up: a long stop beside a short drive and the
+    /// next stop. Columns split the width; every block keeps its own start/end.
+    func testOverlappingBlocksKeepExactHeightsInTheirColumns() throws {
+        let placed = blocks([
+            span("boba", 10, 15, 11, 15),
+            span("home", 11, 15, 11, 33),
+            span("toWalmart", 11, 15, 11, 30),
+            span("walmart", 11, 30, 12, 30)
+        ])
+        let home = try layout("home", in: placed)
+        let toWalmart = try layout("toWalmart", in: placed)
+        let walmart = try layout("walmart", in: placed)
+        XCTAssertEqual(home.columnCount, 2)
+        XCTAssertNotEqual(home.column, toWalmart.column)
+        XCTAssertEqual(home.top, 675, accuracy: 0.01)
+        XCTAssertEqual(home.height, 18, accuracy: 0.01)
+        XCTAssertEqual(toWalmart.top, 675, accuracy: 0.01)
+        XCTAssertEqual(toWalmart.height, 15, accuracy: 0.01)
+        XCTAssertEqual(walmart.top, 690, accuracy: 0.01)
+        XCTAssertEqual(walmart.height, 60, accuracy: 0.01)
+        XCTAssertEqual(try layout("boba", in: placed).height, 60, accuracy: 0.01)
     }
 
     func testThreeMutuallyOverlappingEventsSplitIntoThreeColumns() throws {
@@ -311,24 +418,50 @@ final class ScedraTimelineTests: XCTestCase {
         XCTAssertTrue(chrome.showsDelete, "a full-size block must show the trash, not hide delete in a long-press")
     }
 
-    func testShortestDrawableBlockStillShowsTheTrash() {
-        let floor = DayTimelineMetrics.standard.minimumBlockHeight
-        let chrome = TimelineBlockChrome.forBlock(height: floor, width: phoneLaneWidth)
-        XCTAssertTrue(chrome.showsDelete, "the minimum-height block is the common short appointment — it needs a visible trash")
-        XCTAssertFalse(chrome.showsTime, "there is no room for a time line at the floor height")
+    func testTwentyMinuteDriveGoesCompactInsteadOfGrowing() throws {
+        let placed = shippingBlocks([span("drive", 12, 30, 12, 50)])
+        let drive = try layout("drive", in: placed)
+        let chrome = chrome(for: drive)
+        XCTAssertTrue(chrome.isCompact, "a 20-minute block keeps its height and shrinks its label")
+        XCTAssertTrue(chrome.showsTime, "compact still shows title + time on one line")
+        XCTAssertFalse(chrome.showsLocation)
+        XCTAssertTrue(chrome.showsDelete)
+        XCTAssertLessThanOrEqual(
+            chrome.compactFontSize * 1.2 + TimelineBlockChrome.compactVerticalPadding * 2,
+            drive.height + 0.01,
+            "the single compact line must fit inside the true height"
+        )
+        XCTAssertLessThanOrEqual(chrome.deleteGlyphSize, drive.height - 4 + 0.01)
     }
 
     func testHalfHourAppointmentOnARealDayShowsTheTrash() throws {
         let placed = shippingBlocks([span("dentist", 14, 0, 14, 30)])
         let dentist = try layout("dentist", in: placed)
         XCTAssertTrue(chrome(for: dentist).showsDelete)
+        XCTAssertTrue(chrome(for: dentist).isCompact)
     }
 
     func testFifteenMinuteAppointmentOnARealDayShowsTheTrash() throws {
         let placed = shippingBlocks([span("pickup", 9, 0, 9, 15)])
         let pickup = try layout("pickup", in: placed)
-        XCTAssertEqual(pickup.height, DayTimelineMetrics.standard.minimumBlockHeight, accuracy: 0.01)
+        XCTAssertEqual(pickup.height, DayTimelineMetrics.standard.hourHeight / 4, accuracy: 0.01)
         XCTAssertTrue(chrome(for: pickup).showsDelete)
+    }
+
+    func testHourLongBlockStacksTitleOverTime() throws {
+        let placed = shippingBlocks([span("boba", 10, 15, 11, 15)])
+        let chrome = chrome(for: try layout("boba", in: placed))
+        XCTAssertFalse(chrome.isCompact)
+        XCTAssertTrue(chrome.showsTime)
+        XCTAssertTrue(chrome.showsLocation)
+        XCTAssertTrue(chrome.showsDelete)
+    }
+
+    func testFiveMinuteSliverKeepsDeleteInTheContextMenu() throws {
+        let placed = shippingBlocks([span("ping", 9, 0, 9, 5)])
+        let ping = try layout("ping", in: placed)
+        XCTAssertLessThan(ping.height, TimelineBlockChrome.deleteMinimumHeight)
+        XCTAssertFalse(chrome(for: ping).showsDelete, "a glyph this small would be illegible")
     }
 
     func testTwoOverlappingEventsBothKeepTheirTrash() throws {
@@ -357,105 +490,28 @@ final class ScedraTimelineTests: XCTestCase {
         XCTAssertFalse(chrome(for: a).showsTime)
     }
 
-    // MARK: - Content-minimum height: bubble grows to hold its text
+    // MARK: - Compact label fits the true height
 
-    func testContentMinimumGrowsAShortEventWithoutMovingItsStart() throws {
-        let placed = blocks([
-            TimelineSpan(
-                id: "errand",
-                start: time(9, 0),
-                end: time(9, 10),
-                contentMinimumHeight: TimelineBlockChrome.locationMinimumHeight
-            )
-        ])
-        let errand = try layout("errand", in: placed)
-        XCTAssertEqual(errand.height, TimelineBlockChrome.locationMinimumHeight, accuracy: 0.01)
-        XCTAssertEqual(errand.top, 540, accuracy: 0.01, "growing the bubble must not move the start time")
+    func testCompactFontAlwaysFitsOrBottomsOutAtTheSmallestSize() {
+        for height in stride(from: CGFloat(4), to: TimelineBlockChrome.timeMinimumHeight, by: 0.5) {
+            let chrome = TimelineBlockChrome.forBlock(height: height, width: phoneLaneWidth)
+            XCTAssertTrue(chrome.isCompact)
+            XCTAssertGreaterThanOrEqual(chrome.compactFontSize, 7)
+            XCTAssertLessThanOrEqual(chrome.compactFontSize, 11)
+            let line = chrome.compactFontSize * 1.2 + TimelineBlockChrome.compactVerticalPadding * 2
+            if chrome.compactFontSize > 7 {
+                XCTAssertLessThanOrEqual(line, height + 0.01, "compact text at \(height)pt must fit, not grow the block")
+            }
+        }
     }
 
-    func testContentMinimumDoesNotShrinkALongEvent() throws {
-        let placed = blocks([
-            TimelineSpan(
-                id: "dinner",
-                start: time(18, 0),
-                end: time(21, 0),
-                contentMinimumHeight: TimelineBlockChrome.locationMinimumHeight
-            )
-        ])
-        let dinner = try layout("dinner", in: placed)
-        XCTAssertEqual(dinner.height, 180, accuracy: 0.01)
-        XCTAssertEqual(dinner.top, 1080, accuracy: 0.01)
-    }
-
-    func testContentMinimumIsCappedBeforeTheNextEventInTheLane() throws {
-        let placed = blocks([
-            TimelineSpan(
-                id: "short",
-                start: time(9, 0),
-                end: time(9, 10),
-                contentMinimumHeight: TimelineBlockChrome.locationMinimumHeight
-            ),
-            span("later", 9, 40, 10, 40)
-        ])
-        let short = try layout("short", in: placed)
-        let later = try layout("later", in: placed)
-        XCTAssertEqual(later.top, 580, accuracy: 0.01)
-        XCTAssertEqual(short.top, 540, accuracy: 0.01)
-        XCTAssertEqual(short.height, 40, accuracy: 0.01, "grow down only until the next block in the same lane")
-        XCTAssertEqual(short.columnCount, 1)
-        XCTAssertEqual(later.columnCount, 1)
-        XCTAssertLessThanOrEqual(short.bottom, later.top + 0.01)
-    }
-
-    func testContentMinimumDoesNotGrowIntoABackToBackEvent() throws {
-        let placed = blocks([
-            TimelineSpan(
-                id: "first",
-                start: time(9, 0),
-                end: time(10, 0),
-                contentMinimumHeight: 80
-            ),
-            span("second", 10, 0, 11, 0)
-        ])
-        let first = try layout("first", in: placed)
-        XCTAssertEqual(first.height, 60, accuracy: 0.01, "a full-hour block already fills the gap before the next event")
-        XCTAssertEqual(try layout("second", in: placed).columnCount, 1)
-    }
-
-    func testContentMinimumStillLetsOverlappingEventsSitSideBySide() throws {
-        let placed = blocks([
-            TimelineSpan(
-                id: "dentist",
-                start: time(9, 0),
-                end: time(10, 0),
-                contentMinimumHeight: 80
-            ),
-            TimelineSpan(
-                id: "standup",
-                start: time(9, 30),
-                end: time(10, 30),
-                contentMinimumHeight: 80
-            )
-        ])
-        let dentist = try layout("dentist", in: placed)
-        let standup = try layout("standup", in: placed)
-        XCTAssertEqual(dentist.columnCount, 2)
-        XCTAssertEqual(standup.columnCount, 2)
-        XCTAssertEqual(dentist.height, 80, accuracy: 0.01, "a neighbour in another column must not cap this bubble")
-        XCTAssertEqual(standup.height, 80, accuracy: 0.01)
-        XCTAssertEqual(dentist.top, 540, accuracy: 0.01)
-        XCTAssertEqual(standup.top, 570, accuracy: 0.01)
-    }
-
-    func testContentMinimumHeightMatchesTheChromeThatWillDraw() {
-        XCTAssertEqual(TimelineBlockChrome.contentMinimumHeight(showsTime: false, showsLocation: false), 30)
-        XCTAssertEqual(TimelineBlockChrome.contentMinimumHeight(showsTime: true, showsLocation: false), 46)
-        XCTAssertEqual(TimelineBlockChrome.contentMinimumHeight(showsTime: true, showsLocation: true), 68)
-        let grown = TimelineBlockChrome.contentMinimumHeight(showsTime: true, showsLocation: true)
-        let chrome = TimelineBlockChrome.forBlock(height: grown, width: phoneLaneWidth)
-        XCTAssertTrue(chrome.showsTime)
-        XCTAssertTrue(chrome.showsLocation)
-        XCTAssertTrue(chrome.showsDelete)
+    func testRegularBlockStackedLinesFitTheirThresholds() {
+        // 4pt padding top and bottom, 12pt title line, 10pt detail lines, 1pt spacing.
+        let title = UIFont.systemFont(ofSize: 12, weight: .semibold).lineHeight
+        let detail = UIFont.systemFont(ofSize: 10).lineHeight
+        XCTAssertLessThanOrEqual(8 + title + 1 + detail, TimelineBlockChrome.timeMinimumHeight)
+        XCTAssertLessThanOrEqual(8 + title + 1 + detail + 1 + detail, TimelineBlockChrome.locationMinimumHeight)
+        XCTAssertLessThanOrEqual(8 + title * 2 + 1 + detail + 1 + detail, TimelineBlockChrome.twoLineTitleMinimumHeight)
     }
 
     func testAnythingRoomyEnoughForATimeLabelIsAlsoRoomyEnoughForTheTrash() {
@@ -470,6 +526,78 @@ final class ScedraTimelineTests: XCTestCase {
                 }
             }
         }
+    }
+
+    // MARK: - Jumping to another day from the date header
+
+    func testDayJumpAcrossMonthsCountsWholeDays() {
+        let august = cal.date(from: DateComponents(year: 2026, month: 8, day: 3, hour: 17))!
+        XCTAssertEqual(CalendarDayJump.dayDelta(from: time(9), to: august, calendar: cal), 54)
+        XCTAssertEqual(CalendarDayJump.dayDelta(from: august, to: time(23, 59), calendar: cal), -54)
+    }
+
+    func testDayJumpToTheSameDayIgnoresTimeOfDay() {
+        XCTAssertEqual(CalendarDayJump.dayDelta(from: time(0), to: time(23, 59), calendar: cal), 0)
+    }
+
+    func testDayJumpAcrossADaylightSavingSeamIsStillOneDay() {
+        var pacific = Calendar(identifier: .gregorian)
+        pacific.timeZone = TimeZone(identifier: "America/Los_Angeles")!
+        let before = pacific.date(from: DateComponents(year: 2026, month: 3, day: 7, hour: 12))!
+        let after = pacific.date(from: DateComponents(year: 2026, month: 3, day: 8, hour: 12))!
+        XCTAssertEqual(CalendarDayJump.dayDelta(from: before, to: after, calendar: pacific), 1)
+    }
+
+    func testTodayButtonKnowsWhenItIsAlreadyToday() {
+        XCTAssertTrue(CalendarDayJump.isToday(time(8), now: time(20), calendar: cal))
+        XCTAssertFalse(CalendarDayJump.isToday(time(8), now: time(8).addingTimeInterval(86_400), calendar: cal))
+    }
+
+    func testChooseADayIsTranslated() {
+        XCTAssertEqual(ScedraString("Choose a day", locale: Locale(identifier: "en")), "Choose a day")
+        XCTAssertEqual(ScedraString("Choose a day", locale: Locale(identifier: "fr")), "Choisir un jour")
+        XCTAssertEqual(ScedraString("Choose a day", locale: Locale(identifier: "es")), "Elige un día")
+        XCTAssertEqual(ScedraString("Choose a day", locale: Locale(identifier: "de")), "Tag wählen")
+    }
+
+    func testJumpToTodayAndTodayAreTranslated() {
+        XCTAssertEqual(ScedraString("Jump to today", locale: Locale(identifier: "en")), "Jump to today")
+        XCTAssertEqual(ScedraString("Jump to today", locale: Locale(identifier: "fr")), "Aller à aujourd’hui")
+        XCTAssertEqual(ScedraString("Jump to today", locale: Locale(identifier: "es")), "Ir a hoy")
+        XCTAssertEqual(ScedraString("Jump to today", locale: Locale(identifier: "de")), "Zu heute springen")
+        XCTAssertEqual(ScedraString("Today", locale: Locale(identifier: "fr")), "Aujourd’hui")
+        XCTAssertEqual(ScedraString("Today", locale: Locale(identifier: "es")), "Hoy")
+        XCTAssertEqual(ScedraString("Today", locale: Locale(identifier: "de")), "Heute")
+    }
+
+    func testChooseAMonthIsTranslated() {
+        XCTAssertEqual(ScedraString("Choose a month", locale: Locale(identifier: "en")), "Choose a month")
+        XCTAssertEqual(ScedraString("Choose a month", locale: Locale(identifier: "fr")), "Choisir un mois")
+        XCTAssertEqual(ScedraString("Choose a month", locale: Locale(identifier: "es")), "Elige un mes")
+        XCTAssertEqual(ScedraString("Choose a month", locale: Locale(identifier: "de")), "Monat wählen")
+    }
+
+    func testMonthJumpKeepsTheDayOfMonth() {
+        let august = cal.date(from: DateComponents(year: 2026, month: 8, day: 1))!
+        let jumped = CalendarDayJump.preservingDay(from: dayStart, monthYearOf: august, calendar: cal)
+        XCTAssertEqual(cal.component(.year, from: jumped), 2026)
+        XCTAssertEqual(cal.component(.month, from: jumped), 8)
+        XCTAssertEqual(cal.component(.day, from: jumped), 10)
+    }
+
+    func testMonthJumpClampsJanuary31IntoFebruary() {
+        let january31 = cal.date(from: DateComponents(year: 2026, month: 1, day: 31))!
+        let february = cal.date(from: DateComponents(year: 2026, month: 2, day: 1))!
+        let jumped = CalendarDayJump.preservingDay(from: january31, monthYearOf: february, calendar: cal)
+        XCTAssertEqual(cal.component(.month, from: jumped), 2)
+        XCTAssertEqual(cal.component(.day, from: jumped), 28)
+    }
+
+    func testGridTapIsADayPickAndMonthBrowseIsNot() {
+        let june20 = cal.date(byAdding: .day, value: 10, to: dayStart)!
+        XCTAssertTrue(CalendarDayJump.isDayPick(from: dayStart, to: june20, calendar: cal))
+        let july10 = cal.date(byAdding: .month, value: 1, to: dayStart)!
+        XCTAssertFalse(CalendarDayJump.isDayPick(from: dayStart, to: july10, calendar: cal))
     }
 
     // MARK: - Which day content the Calendar tab picks

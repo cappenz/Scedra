@@ -147,32 +147,36 @@ struct DayTimelineView: View {
         }
         .frame(height: metrics.totalHeight)
         .padding(.horizontal, 10)
+        // Room for the 12 AM label, which is centred on the very first rule.
+        .padding(.top, 8)
         .padding(.bottom, 24)
     }
 
+    /// Each row's top edge is its hour rule, at exactly `hour * hourHeight` —
+    /// the same scale the blocks use. The label is an overlay so its text height
+    /// can't push the rule down off the hour.
     private var hourGrid: some View {
         VStack(spacing: 0) {
             ForEach(0..<24, id: \.self) { hour in
-                HStack(alignment: .top, spacing: 0) {
+                ZStack(alignment: .topLeading) {
+                    Rectangle()
+                        .fill(ScedraTheme.lavender.opacity(0.55))
+                        .frame(height: 1)
+                    Rectangle()
+                        .fill(ScedraTheme.lavender.opacity(0.3))
+                        .frame(height: 1)
+                        .offset(y: metrics.hourHeight / 2)
+                }
+                .padding(.leading, gutterWidth)
+                .frame(maxWidth: .infinity, alignment: .topLeading)
+                .frame(height: metrics.hourHeight, alignment: .top)
+                .overlay(alignment: .topLeading) {
                     Text(hourLabel(hour))
                         .font(.system(size: 11, weight: .medium))
                         .foregroundStyle(ScedraTheme.purple.opacity(0.55))
-                        .frame(width: gutterWidth - 8, alignment: .trailing)
-                        // Sit the label on the rule rather than under it.
-                        .alignmentGuide(.top) { $0[VerticalAlignment.center] }
-                    ZStack(alignment: .topLeading) {
-                        Rectangle()
-                            .fill(ScedraTheme.lavender.opacity(0.55))
-                            .frame(height: 1)
-                        Rectangle()
-                            .fill(ScedraTheme.lavender.opacity(0.3))
-                            .frame(height: 1)
-                            .offset(y: metrics.hourHeight / 2)
-                    }
-                    .frame(maxWidth: .infinity, alignment: .topLeading)
-                    .padding(.leading, 8)
+                        .fixedSize()
+                        .frame(width: gutterWidth - 8, height: 1, alignment: .trailing)
                 }
-                .frame(height: metrics.hourHeight, alignment: .top)
                 .id(hourAnchor(hour))
             }
         }
@@ -210,12 +214,7 @@ struct DayTimelineView: View {
     private var placedEvents: [PlacedEvent] {
         let timed = timedItems
         let spans = timed.enumerated().map {
-            TimelineSpan(
-                id: String($0.offset),
-                start: $0.element.start,
-                end: $0.element.end,
-                contentMinimumHeight: contentMinimumHeight(for: $0.element)
-            )
+            TimelineSpan(id: String($0.offset), start: $0.element.start, end: $0.element.end)
         }
         return DayTimelineLayout.blocks(for: spans, dayStart: dayStart, dayEnd: dayEnd, metrics: metrics)
             .compactMap { block in
@@ -224,52 +223,47 @@ struct DayTimelineView: View {
             }
     }
 
-    /// Grow the bubble to hold time (and location, when the event has one).
-    /// Width still decides whether those lines actually draw; a narrow sliver
-    /// just gets a little extra empty height.
-    private func contentMinimumHeight(for item: TodayItem) -> CGFloat {
-        let hasLocation = item.location.map { !$0.isEmpty } ?? false
-        return TimelineBlockChrome.contentMinimumHeight(showsTime: true, showsLocation: hasLocation)
-    }
-
     private func eventBlock(_ placed: PlacedEvent, laneWidth: CGFloat) -> some View {
         let layout = placed.layout
         let item = placed.item
         let width = layout.width(inLaneWidth: laneWidth, spacing: metrics.columnSpacing)
-        let original = item.originalText
+        let original = item.hasOriginal
         let chrome = TimelineBlockChrome.forBlock(height: layout.height, width: width)
         let leading = gutterWidth + laneInset + layout.xOffset(inLaneWidth: laneWidth)
+        let radius = min(cornerRadius, layout.height / 2)
 
-        let bubble = RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+        let bubble = RoundedRectangle(cornerRadius: radius, style: .continuous)
 
-        return ZStack(alignment: .topTrailing) {
-            Button {
-                onSelect(item)
-            } label: {
-                // Clip the filled card here — on the Button label. A clipShape
-                // on this ZStack never reaches Button drawing, and a clip only
-                // inside TimelineBlockBody still let title/time/address paint
-                // past the rounded fill (the Rideing / Schoool screenshot).
-                TimelineBlockLabel(
-                    item: item,
-                    layout: layout,
-                    hasOriginal: original != nil,
-                    showsDetail: chrome.showsTime,
-                    showsLocation: chrome.showsLocation,
-                    reservesDeleteSpace: chrome.showsDelete,
-                    cornerRadius: cornerRadius,
-                    width: width,
-                    height: layout.height
-                )
-            }
-            .buttonStyle(TimelineBlockButtonStyle(cornerRadius: cornerRadius))
-
+        return Button {
+            onSelect(item)
+        } label: {
+            // Clip the filled card here — on the Button label. A clipShape
+            // on a wrapper ZStack never reaches Button drawing, and a clip only
+            // inside TimelineBlockBody still let title/time/address paint
+            // past the rounded fill (the Rideing / Schoool screenshot).
+            TimelineBlockLabel(
+                item: item,
+                layout: layout,
+                hasOriginal: original,
+                showsDetail: chrome.showsTime,
+                showsLocation: chrome.showsLocation,
+                reservesDeleteSpace: chrome.showsDelete,
+                cornerRadius: radius,
+                width: width,
+                height: layout.height,
+                isCompact: chrome.isCompact,
+                compactFontSize: chrome.compactFontSize
+            )
+        }
+        .buttonStyle(TimelineBlockButtonStyle(cornerRadius: radius))
+        .frame(width: width, height: layout.height, alignment: .topLeading)
+        .overlay(alignment: .topTrailing) {
+            // Overlay so the glyph cannot grow the block past its end time.
             if chrome.showsDelete {
-                deleteGlyph(item)
-                    .zIndex(1)
+                deleteGlyph(item, chrome: chrome, blockHeight: layout.height)
             }
         }
-        .frame(width: width, height: layout.height, alignment: .topLeading)
+        .clipped()
         .contentShape(bubble)
         .contextMenu {
             Button {
@@ -299,20 +293,38 @@ struct DayTimelineView: View {
 
     /// The always-visible way out of an appointment. Routes to the same
     /// confirmation and the same EventKit delete the list rows use.
-    private func deleteGlyph(_ item: TodayItem) -> some View {
-        Button {
-            onDelete(item)
-        } label: {
-            Image(systemName: "trash")
-                .font(.system(size: 11, weight: .semibold))
-                .foregroundStyle(ScedraTheme.conflict)
-                .padding(8)
-                .background(ScedraTheme.card.opacity(0.94), in: Circle())
-                .contentShape(Circle())
+    ///
+    /// Compact blocks get a smaller glyph centred in a full-height trailing strip,
+    /// so it stays tappable without making the block taller than its event.
+    @ViewBuilder
+    private func deleteGlyph(_ item: TodayItem, chrome: TimelineBlockChrome, blockHeight: CGFloat) -> some View {
+        if chrome.isCompact {
+            Button {
+                onDelete(item)
+            } label: {
+                Image(systemName: "trash")
+                    .font(.system(size: chrome.deleteGlyphSize, weight: .semibold))
+                    .foregroundStyle(ScedraTheme.conflict)
+                    .frame(width: TimelineBlockChrome.compactDeleteReserve, height: blockHeight)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Delete \(item.title)")
+        } else {
+            Button {
+                onDelete(item)
+            } label: {
+                Image(systemName: "trash")
+                    .font(.system(size: chrome.deleteGlyphSize, weight: .semibold))
+                    .foregroundStyle(ScedraTheme.conflict)
+                    .padding(8)
+                    .background(ScedraTheme.card.opacity(0.94), in: Circle())
+                    .contentShape(Circle())
+            }
+            .buttonStyle(.plain)
+            .padding(2)
+            .accessibilityLabel("Delete \(item.title)")
         }
-        .buttonStyle(.plain)
-        .padding(2)
-        .accessibilityLabel("Delete \(item.title)")
     }
 
     // MARK: - All-day strip
@@ -342,15 +354,15 @@ struct DayTimelineView: View {
     }
 
     private func allDayChip(_ item: TodayItem) -> some View {
-        let original = item.originalText
+        let original = item.hasOriginal
         return HStack(spacing: 6) {
             HStack(spacing: 4) {
                 Text(item.title)
                     .font(.system(size: 12, weight: .medium))
                     .foregroundStyle(ScedraTheme.deepPurple)
                     .lineLimit(1)
-                if original != nil {
-                    Image(systemName: "doc.text")
+                if original {
+                    Image(systemName: item.originalIndicatorSymbol)
                         .font(.system(size: 9))
                         .foregroundStyle(ScedraTheme.purple.opacity(0.7))
                 }
@@ -466,6 +478,15 @@ struct DayTimelineView: View {
     }
 
     private func restInterestingPlace(_ proxy: ScrollViewProxy) {
+        #if DEBUG
+        // `-scedra-timeline-scroll-hour 14` pins the opening hour for simulator screenshots.
+        if let debugHour = UserDefaults.standard.string(forKey: "scedra-timeline-scroll-hour").flatMap(Int.init) {
+            DispatchQueue.main.async {
+                proxy.scrollTo(hourAnchor(min(max(debugHour, 0), 23)), anchor: .top)
+            }
+            return
+        }
+        #endif
         // Cards sit above the hours so they aren't buried after 11pm. Skip the
         // usual jump-to-event when this day has problem cards to show.
         if !noticeStops.isEmpty {
@@ -499,6 +520,8 @@ struct TimelineBlockLabel: View {
     let cornerRadius: CGFloat
     let width: CGFloat
     let height: CGFloat
+    var isCompact: Bool = false
+    var compactFontSize: CGFloat = 11
 
     private var bubble: RoundedRectangle {
         RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
@@ -513,9 +536,11 @@ struct TimelineBlockLabel: View {
             showsLocation: showsLocation,
             reservesDeleteSpace: reservesDeleteSpace,
             width: width,
-            height: height
+            height: height,
+            isCompact: isCompact,
+            compactFontSize: compactFontSize
         )
-        .frame(minWidth: 0, maxWidth: width)
+        .frame(minWidth: 0, maxWidth: width, minHeight: 0, maxHeight: height)
         .frame(width: width, height: height, alignment: .topLeading)
         .background(ScedraTheme.card)
         .overlay(bubble.stroke(ScedraTheme.lavender, lineWidth: 1))
@@ -555,21 +580,83 @@ struct TimelineBlockBody: View {
     let reservesDeleteSpace: Bool
     let width: CGFloat
     let height: CGFloat
+    /// Single line, smaller font: the block is too short to stack title over time.
+    var isCompact: Bool = false
+    var compactFontSize: CGFloat = 11
 
     /// Title / time / location column: card width minus the accent bar and padding.
     private var textWidth: CGFloat {
-        TimelineBlockChrome.textWidth(cardWidth: width, reservesDeleteSpace: reservesDeleteSpace)
+        TimelineBlockChrome.textWidth(
+            cardWidth: width,
+            reservesDeleteSpace: reservesDeleteSpace,
+            compact: isCompact
+        )
+    }
+
+    private var trailingPadding: CGFloat {
+        guard reservesDeleteSpace else { return 6 }
+        return isCompact ? TimelineBlockChrome.compactDeleteReserve : TimelineBlockChrome.deleteReserve
     }
 
     var body: some View {
-        cardContent
-            .padding(.leading, 6)
-            .padding(.trailing, reservesDeleteSpace ? 28 : 6)
-            .padding(.vertical, 4)
-            .frame(minWidth: 0, maxWidth: width)
-            .frame(width: width, height: height, alignment: .topLeading)
-            .overlay(alignment: .top) { continuationMark("chevron.up", shown: layout.continuesBeforeDay) }
-            .overlay(alignment: .bottom) { continuationMark("chevron.down", shown: layout.continuesAfterDay) }
+        Group {
+            if isCompact {
+                compactContent
+                    .padding(.vertical, TimelineBlockChrome.compactVerticalPadding)
+            } else {
+                cardContent
+                    .padding(.vertical, 4)
+            }
+        }
+        .padding(.leading, 6)
+        .padding(.trailing, trailingPadding)
+        .frame(minWidth: 0, maxWidth: width, minHeight: 0, maxHeight: height)
+        .frame(width: width, height: height, alignment: isCompact ? .leading : .topLeading)
+        .clipped()
+        .overlay(alignment: .top) { continuationMark("chevron.up", shown: layout.continuesBeforeDay && !isCompact) }
+        .overlay(alignment: .bottom) { continuationMark("chevron.down", shown: layout.continuesAfterDay && !isCompact) }
+    }
+
+    /// Title then time on one line, clipped by the label's rounded rect.
+    private var compactContent: some View {
+        HStack(alignment: .center, spacing: 6) {
+            Capsule()
+                .fill(ScedraTheme.purple.opacity(0.85))
+                .frame(width: 3)
+                .frame(maxHeight: .infinity)
+            if height >= TimelineBlockChrome.compactTextMinimumHeight {
+                // Full range, then start time, then a truncated title — whichever fits the column.
+                ViewThatFits(in: .horizontal) {
+                    if showsDetail {
+                        compactLine(time: timeLabel)
+                        compactLine(time: item.start.scedraDisplay(date: .omitted, time: .shortened))
+                    }
+                    compactTitle
+                }
+                .frame(minWidth: 0, maxWidth: textWidth, alignment: .leading)
+            }
+        }
+        .frame(minWidth: 0, maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
+    }
+
+    private var compactTitle: some View {
+        Text(item.title)
+            .font(.system(size: compactFontSize, weight: .semibold))
+            .foregroundStyle(ScedraTheme.deepPurple)
+            .lineLimit(1)
+            .truncationMode(.tail)
+    }
+
+    private func compactLine(time: String) -> some View {
+        HStack(spacing: 4) {
+            compactTitle
+                .fixedSize()
+            Text(time)
+                .font(.system(size: compactFontSize))
+                .foregroundStyle(ScedraTheme.purple.opacity(0.85))
+                .lineLimit(1)
+                .fixedSize()
+        }
     }
 
     private var cardContent: some View {
@@ -602,11 +689,11 @@ struct TimelineBlockBody: View {
             Text(item.title)
                 .font(.system(size: 12, weight: .semibold))
                 .foregroundStyle(ScedraTheme.deepPurple)
-                .lineLimit(showsDetail ? 2 : 1)
+                .lineLimit(showsDetail ? TimelineBlockChrome.titleLineLimit(height: height) : 1)
                 .truncationMode(.tail)
                 .frame(minWidth: 0, maxWidth: .infinity, alignment: .leading)
             if hasOriginal {
-                Image(systemName: "doc.text")
+                Image(systemName: item.originalIndicatorSymbol)
                     .font(.system(size: 8))
                     .foregroundStyle(ScedraTheme.purple.opacity(0.7))
             }

@@ -4,6 +4,7 @@ struct TasksTabView: View {
     var calendar: CalendarStore
     var tasks: TaskRepository
 
+    @Environment(OnboardingGuide.self) private var onboarding
     @State private var editor: TaskEditorSession?
     @State private var pendingDelete: ScedraTask?
     @State private var showSettings = false
@@ -44,14 +45,27 @@ struct TasksTabView: View {
                 .background(ScedraTheme.background.ignoresSafeArea(edges: .top))
             }
             .task {
-                tasks.reconcile()
+                await tasks.pruneCompleted(writer: calendar)
+                await tasks.reconcilePlacements(calendar: calendar)
                 while !Task.isCancelled {
                     try? await Task.sleep(for: .seconds(60))
-                    tasks.reconcile()
+                    await tasks.pruneCompleted(writer: calendar)
+                    await tasks.reconcilePlacements(calendar: calendar)
                 }
             }
             .sheet(isPresented: $showSettings) {
                 SettingsView()
+            }
+            .onChange(of: onboarding.pendingTaskCreate) { _, pending in
+                guard pending else { return }
+                editor = .create(ScedraTask(title: ""))
+                onboarding.consumePendingTaskCreate()
+            }
+            .onAppear {
+                if onboarding.pendingTaskCreate {
+                    editor = .create(ScedraTask(title: ""))
+                    onboarding.consumePendingTaskCreate()
+                }
             }
             .sheet(item: $editor) { session in
                 TaskEditorView(
@@ -215,7 +229,7 @@ struct TasksTabView: View {
     private func taskRow(_ task: ScedraTask) -> some View {
         HStack(alignment: .top, spacing: 8) {
             Button {
-                tasks.setCompleted(task, isCompleted: !task.isCompleted)
+                Task { await tasks.setCompleted(task, isCompleted: !task.isCompleted, from: calendar) }
             } label: {
                 Image(systemName: task.isCompleted ? "checkmark.circle.fill" : "circle")
                     .font(.title3)
@@ -231,6 +245,14 @@ struct TasksTabView: View {
                     .font(.body.weight(.medium))
                     .foregroundStyle(ScedraTheme.deepPurple)
                     .strikethrough(task.isCompleted, color: ScedraTheme.purple.opacity(0.55))
+                if task.importance == .important, !task.isCompleted {
+                    Text("Important")
+                        .font(.caption2.weight(.semibold))
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 3)
+                        .background(ScedraTheme.purple.opacity(0.18), in: Capsule())
+                        .foregroundStyle(ScedraTheme.purple)
+                }
                 Text(detailLine(for: task))
                     .font(.caption)
                     .foregroundStyle(.secondary)

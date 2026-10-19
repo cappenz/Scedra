@@ -199,7 +199,9 @@ struct DraftEvent: Identifiable, Equatable {
             latitude: locationLatitude,
             longitude: locationLongitude,
             usesHome: place.isEmpty || HomeGapLogic.looksLikeHome(place),
-            notes: (details + [sourceText]).joined(separator: "\n")
+            notes: (details + [sourceText]).joined(separator: "\n"),
+            isDriveEvent: false,
+            calendarEventID: id.uuidString
         )
     }
 }
@@ -350,9 +352,6 @@ enum ReviewTimeTyping {
             guard merRange.location != NSNotFound, merRange.length > 0 else { return nil }
             return nsText.substring(with: merRange)
         }()
-        let hasMinutes = match.range(at: 2).location != NSNotFound
-        if hourRaw > 12, !hasMinutes, meridian == nil { return nil }
-
         let applied = ClockTimeParser.applyMeridian(hour: hourRaw, minute: minute, meridian: meridian)
         if meridian != nil || hourRaw == 0 || hourRaw > 12 {
             return .clock(hour: applied.hour, minute: applied.minute, resolved: true)

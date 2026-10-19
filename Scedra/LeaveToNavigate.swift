@@ -50,11 +50,25 @@ enum LeaveToNavigateNotifier {
         _ = try? await center.requestAuthorization(options: [.alert, .sound])
     }
 
-    static func reschedule(_ drafts: [LeaveToNavigateDraft], now: Date = Date()) async {
+    static func reschedule(
+        _ drafts: [LeaveToNavigateDraft],
+        liveIdentifiers: Set<String>? = nil,
+        now: Date = Date()
+    ) async {
         await requestAuthorization()
         let center = UNUserNotificationCenter.current()
         let pending = await center.pendingNotificationRequests()
-        let stale = pending.map(\.identifier).filter { $0.hasPrefix(idPrefix) }
+        let newIDs = Set(drafts.map(\.identifier))
+        let stale = pending
+            .map(\.identifier)
+            .filter { $0.hasPrefix(idPrefix) }
+            .filter { identifier in
+                if newIDs.contains(identifier) { return true }
+                if let liveIdentifiers {
+                    return !liveIdentifiers.contains(identifier)
+                }
+                return true
+            }
         center.removePendingNotificationRequests(withIdentifiers: stale)
 
         for draft in drafts where draft.fire > now {
@@ -96,21 +110,18 @@ enum LeaveToNavigateNotifier {
         mode: TravelMode = .drive
     ) -> LeaveToNavigateDraft? {
         guard !item.isAllDay else { return nil }
+        if isGoHomeDrive(item) { return nil }
         guard let leave = leaveBy(for: item, bufferMinutes: bufferMinutes), leave > now else {
             return nil
         }
         let coordinate = pin ?? item.navigationCoordinate
         guard let coordinate, CLLocationCoordinate2DIsValid(coordinate) else { return nil }
-        let place = item.placeLabel?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        let name = place.isEmpty ? item.title : place
+        let name = destinationName(for: item)
         let resolvedMode = item.savedInfo.travelMode ?? mode
-        let body = resolvedMode == .transit
-            ? ScedraString("Leave now — transit to \(name).")
-            : ScedraString("Leave now — Google Maps or Waze to \(name).")
         return LeaveToNavigateDraft(
-            identifier: idPrefix + item.occurrenceKey,
-            title: ScedraString("Time to leave for \(item.title)"),
-            body: body,
+            identifier: notificationIdentifier(for: item),
+            title: leaveNowTitle(destination: name, mode: resolvedMode),
+            body: ScedraString("Tap to open Maps"),
             fire: leave,
             latitude: coordinate.latitude,
             longitude: coordinate.longitude,
@@ -119,9 +130,75 @@ enum LeaveToNavigateNotifier {
         )
     }
 
-    /// Prefer the leave-by written for this mode. Padded EventKit start is the fallback.
+    static func notificationIdentifier(for item: TodayItem) -> String {
+        item.isDriveEvent ? idPrefix + item.id : idPrefix + item.occurrenceKey
+    }
+
+    /// Drive home / Drive from stay off — Don’t-go-home cards are not leave-now banners.
+    static func isGoHomeDrive(_ item: TodayItem) -> Bool {
+        guard item.isDriveEvent else { return false }
+        if DriveTimeLogic.inferredLeg(title: item.title, notes: item.notes) == .onward {
+            return true
+        }
+        let folded = item.title.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return folded.hasPrefix("drive home")
+            || folded.hasPrefix("transit home")
+            || folded.hasPrefix("walk home")
+            || folded.hasPrefix("trajet maison")
+            || folded.hasPrefix("trayecto a casa")
+            || folded.hasPrefix("fahrt nach hause")
+    }
+
+    static func destinationName(for item: TodayItem) -> String {
+        if item.isDriveEvent {
+            let place = DriveTimeLogic.shortPlace(item.placeLabel ?? "")
+            if !place.isEmpty, !HomeGapLogic.looksLikeHome(place) {
+                return place
+            }
+            if let parsed = destinationFromDriveTitle(item.title), !parsed.isEmpty {
+                return parsed
+            }
+        }
+        let place = DriveTimeLogic.shortPlace(item.placeLabel ?? "")
+        return place.isEmpty ? item.title : place
+    }
+
+    static func destinationFromDriveTitle(_ title: String) -> String? {
+        let prefixes = [
+            "Drive to ", "Transit to ", "Walk to ",
+            "Trajet vers ", "Trayecto a ", "Fahrt zu "
+        ]
+        let folded = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        for prefix in prefixes {
+            guard folded.lowercased().hasPrefix(prefix.lowercased()) else { continue }
+            var rest = String(folded.dropFirst(prefix.count))
+            for marker in [" from ", " de ", " von "] {
+                if let range = rest.range(of: marker, options: .caseInsensitive) {
+                    rest = String(rest[..<range.lowerBound])
+                }
+            }
+            let trimmed = rest.trimmingCharacters(in: .whitespacesAndNewlines)
+            return trimmed.isEmpty ? nil : trimmed
+        }
+        return nil
+    }
+
+    static func leaveNowTitle(destination: String, mode: TravelMode) -> String {
+        switch mode {
+        case .transit: return ScedraString("Leave now — transit to \(destination)")
+        case .walk: return ScedraString("Leave now — walk to \(destination)")
+        case .drive: return ScedraString("Leave now — drive to \(destination)")
+        }
+    }
+
+    /// Drive siblings fire at the block start (leave-by for inbound from Home).
+    /// Appointments use the leave-by line, then padded start, then drive minutes.
     static func leaveBy(for item: TodayItem, bufferMinutes: Int = UserProfile.defaultHomeGapMinutes) -> Date? {
         guard !item.isAllDay else { return nil }
+        if item.isDriveEvent {
+            if isGoHomeDrive(item) { return nil }
+            return item.start
+        }
         if let parsed = parseLeaveByLine(item.savedInfo.leaveByLine, around: item.officialStart) {
             return parsed
         }
@@ -151,6 +228,16 @@ enum LeaveToNavigateNotifier {
     static func driveMinutes(from line: String?) -> Int? {
         guard let line, !line.isEmpty else { return nil }
         guard let match = line.range(of: #"~(\d+)\s*min"#, options: .regularExpression) else {
+            return nil
+        }
+        let digits = line[match].filter(\.isNumber)
+        return Int(digits)
+    }
+
+    /// "~18 min back" on a Drive: round-trip line. Nil when notes only stored outbound.
+    static func returnMinutes(from line: String?) -> Int? {
+        guard let line, !line.isEmpty else { return nil }
+        guard let match = line.range(of: #"~(\d+)\s*min back"#, options: .regularExpression) else {
             return nil
         }
         let digits = line[match].filter(\.isNumber)
@@ -220,8 +307,18 @@ enum LeaveToNavigatePlanner {
         let buffer = UserDefaults.standard.object(forKey: UserProfile.homeGapKey) as? Int
             ?? UserProfile.defaultHomeGapMinutes
         let resolver = PlaceResolver()
+        let coveredAppointments = Set(items.compactMap { item -> String? in
+            guard item.isDriveEvent else { return nil }
+            let leg = DriveTimeLogic.inferredLeg(title: item.title, notes: item.notes)
+            guard leg == .inbound || leg == .between else { return nil }
+            return DriveTimeLogic.appointmentIdentifier(fromDriveNotes: item.notes)
+                ?? DriveTimeLogic.endpointIDs(fromNotes: item.notes).to
+        })
         var drafts: [LeaveToNavigateDraft] = []
         for item in items {
+            if !item.isDriveEvent, coveredAppointments.contains(item.id) {
+                continue
+            }
             let pin = await destinationPin(for: item, resolver: resolver)
             let mode = item.savedInfo.travelMode ?? settingsMode
             if let draft = LeaveToNavigateNotifier.draft(
@@ -234,7 +331,8 @@ enum LeaveToNavigatePlanner {
                 drafts.append(draft)
             }
         }
-        await LeaveToNavigateNotifier.reschedule(drafts, now: now)
+        let live = Set(items.map { LeaveToNavigateNotifier.notificationIdentifier(for: $0) })
+        await LeaveToNavigateNotifier.reschedule(drafts, liveIdentifiers: live, now: now)
     }
 
     static func destinationPin(for item: TodayItem, resolver: PlaceResolver) async -> CLLocationCoordinate2D? {

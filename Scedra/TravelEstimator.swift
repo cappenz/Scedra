@@ -384,24 +384,40 @@ enum TravelEstimator {
         return parts.joined(separator: " · ")
     }
 
-    /// Review planning uses Settings Home when that address geocoded.
-    /// A Core Location fix (including Simulator Features → Location / Apple Park) is
-    /// the origin when Home is empty. Simulator is not a reason to discard GPS.
-    static func shouldTrustCurrentFix(homeAddressIsSet: Bool, isSimulator: Bool) -> Bool {
+    /// Current/last-known pin is trusted for “from here” when Search from is Current
+    /// location. Home-first only when that setting is Home (and Home is set).
+    /// Simulator is not a reason to discard GPS.
+    static func shouldTrustCurrentFix(
+        homeAddressIsSet: Bool,
+        isSimulator: Bool,
+        searchFrom: PlaceSearchFrom = .currentLocation
+    ) -> Bool {
         _ = isSimulator
+        if searchFrom == .currentLocation { return true }
         if homeAddressIsSet { return false }
         return true
     }
 
-    /// Review drive origin: Settings Home when we have it, else a sane Core Location fix.
+    /// Drive origin: current or last-known pin when Search from is Current location
+    /// and a pin exists. Fallback Home, then a trusted live fix.
     static func preferredOrigin(
         current: CLLocation?,
         home: CLLocation?,
-        currentIsTrusted: Bool
+        currentIsTrusted: Bool,
+        lastKnown: CLLocation? = nil,
+        searchFrom: PlaceSearchFrom = .currentLocation
     ) -> CLLocation? {
+        let pin = current ?? lastKnown
+        if searchFrom == .currentLocation {
+            if currentIsTrusted, let current { return current }
+            if let lastKnown { return lastKnown }
+            if let home { return home }
+            if currentIsTrusted, let pin { return pin }
+            return nil
+        }
         if let home { return home }
-        if currentIsTrusted, let current { return current }
-        return nil
+        if currentIsTrusted, let pin { return pin }
+        return lastKnown
     }
 
     /// MKDirections reports seconds. There is no 60-minute default — 0 or garbage is "unknown".
@@ -560,6 +576,9 @@ enum TravelEstimator {
     }
 
     /// Apple Maps minutes for a transport type at a planned departure. Never guesses.
+    /// Successful minutes are cached by origin + destination + mode + 5-minute
+    /// departure bucket so day-chain reconcile can reuse them. Failures (including
+    /// GEOErrorDomain -3 throttle) are not cached. Same-place pins skip Maps.
     static func mapsMinutes(
         from origin: CLLocationCoordinate2D,
         to destination: CLLocationCoordinate2D,
@@ -569,6 +588,86 @@ enum TravelEstimator {
         guard CLLocationCoordinate2DIsValid(origin), CLLocationCoordinate2DIsValid(destination) else {
             return nil
         }
+        if isApproximatelySamePlace(origin, destination) {
+            return nil
+        }
+        if let cached = cachedMinutes(
+            from: origin,
+            to: destination,
+            departingAt: departure,
+            transportType: transportType
+        ) {
+            return cached
+        }
+
+        let minutes = await MKDirectionsGate.shared.limit {
+            await requestMapsMinutes(
+                from: origin,
+                to: destination,
+                departingAt: departure,
+                transportType: transportType
+            )
+        }
+        if let minutes, minutes > 0 {
+            rememberMinutes(
+                from: origin,
+                to: destination,
+                departingAt: departure,
+                transportType: transportType,
+                minutes: minutes
+            )
+        }
+        return minutes
+    }
+
+    /// Home / same-building pins — do not spend an MKDirections quota.
+    static func isApproximatelySamePlace(
+        _ lhs: CLLocationCoordinate2D,
+        _ rhs: CLLocationCoordinate2D
+    ) -> Bool {
+        HomeGapLogic.pinsAreSamePlace(lhs, rhs)
+    }
+
+    static func cachedMinutes(
+        from origin: CLLocationCoordinate2D,
+        to destination: CLLocationCoordinate2D,
+        departingAt departure: Date,
+        transportType: MKDirectionsTransportType
+    ) -> Int? {
+        TravelMinutesCache.minutes(
+            from: origin,
+            to: destination,
+            departingAt: departure,
+            transportType: transportType
+        )
+    }
+
+    static func rememberMinutes(
+        from origin: CLLocationCoordinate2D,
+        to destination: CLLocationCoordinate2D,
+        departingAt departure: Date,
+        transportType: MKDirectionsTransportType,
+        minutes: Int
+    ) {
+        TravelMinutesCache.store(
+            from: origin,
+            to: destination,
+            departingAt: departure,
+            transportType: transportType,
+            minutes: minutes
+        )
+    }
+
+    static func resetMinutesCache() {
+        TravelMinutesCache.reset()
+    }
+
+    private static func requestMapsMinutes(
+        from origin: CLLocationCoordinate2D,
+        to destination: CLLocationCoordinate2D,
+        departingAt departure: Date,
+        transportType: MKDirectionsTransportType
+    ) async -> Int? {
         let request = MKDirections.Request()
         request.source = MKMapItem(placemark: MKPlacemark(coordinate: origin))
         request.destination = MKMapItem(placemark: MKPlacemark(coordinate: destination))
@@ -601,5 +700,112 @@ enum TravelEstimator {
             return actual == .walking || actual.contains(.walking)
         }
         return actual == requested
+    }
+}
+
+/// Caps live `MKDirections.calculate()` so a day reconcile cannot burst 50 pairs.
+private actor MKDirectionsGate {
+    static let shared = MKDirectionsGate()
+    private let limit = 2
+    private var running = 0
+    private var waiting: [CheckedContinuation<Void, Never>] = []
+
+    func limit<T: Sendable>(_ work: @Sendable () async -> T) async -> T {
+        await acquire()
+        let result = await work()
+        release()
+        return result
+    }
+
+    private func acquire() async {
+        while running >= limit {
+            await withCheckedContinuation { waiting.append($0) }
+        }
+        running += 1
+    }
+
+    private func release() {
+        running -= 1
+        if waiting.isEmpty { return }
+        waiting.removeFirst().resume()
+    }
+}
+
+/// In-memory + small UserDefaults JSON. Keyed by pins, transport, and a 5-minute leave bucket.
+private enum TravelMinutesCache {
+    static let defaultsKey = "scedra.travelMinutesCache"
+    static let bucketSeconds: TimeInterval = 5 * 60
+    private static let maxEntries = 200
+    private static let lock = NSLock()
+    private static var memory: [String: Entry] = load()
+
+    struct Entry: Codable {
+        var minutes: Int
+        var savedAt: TimeInterval
+    }
+
+    static func minutes(
+        from origin: CLLocationCoordinate2D,
+        to destination: CLLocationCoordinate2D,
+        departingAt departure: Date,
+        transportType: MKDirectionsTransportType
+    ) -> Int? {
+        let key = cacheKey(from: origin, to: destination, departingAt: departure, transportType: transportType)
+        lock.lock()
+        let value = memory[key]?.minutes
+        lock.unlock()
+        return value.flatMap { $0 > 0 ? $0 : nil }
+    }
+
+    static func store(
+        from origin: CLLocationCoordinate2D,
+        to destination: CLLocationCoordinate2D,
+        departingAt departure: Date,
+        transportType: MKDirectionsTransportType,
+        minutes: Int
+    ) {
+        guard minutes > 0 else { return }
+        let key = cacheKey(from: origin, to: destination, departingAt: departure, transportType: transportType)
+        lock.lock()
+        memory[key] = Entry(minutes: minutes, savedAt: Date().timeIntervalSince1970)
+        persistLocked()
+        lock.unlock()
+    }
+
+    static func reset() {
+        lock.lock()
+        memory = [:]
+        UserDefaults.standard.removeObject(forKey: defaultsKey)
+        lock.unlock()
+    }
+
+    static func cacheKey(
+        from origin: CLLocationCoordinate2D,
+        to destination: CLLocationCoordinate2D,
+        departingAt departure: Date,
+        transportType: MKDirectionsTransportType
+    ) -> String {
+        let bucket = Int(floor(departure.timeIntervalSince1970 / bucketSeconds))
+        func pin(_ coordinate: CLLocationCoordinate2D) -> String {
+            String(format: "%.4f,%.4f", coordinate.latitude, coordinate.longitude)
+        }
+        return "\(pin(origin))|\(pin(destination))|\(transportType.rawValue)|\(bucket)"
+    }
+
+    private static func load() -> [String: Entry] {
+        guard let data = UserDefaults.standard.data(forKey: defaultsKey),
+              let decoded = try? JSONDecoder().decode([String: Entry].self, from: data)
+        else { return [:] }
+        return decoded
+    }
+
+    private static func persistLocked() {
+        if memory.count > maxEntries {
+            let keep = memory.sorted { $0.value.savedAt > $1.value.savedAt }.prefix(maxEntries)
+            memory = Dictionary(uniqueKeysWithValues: keep.map { ($0.key, $0.value) })
+        }
+        if let data = try? JSONEncoder().encode(memory) {
+            UserDefaults.standard.set(data, forKey: defaultsKey)
+        }
     }
 }

@@ -107,6 +107,12 @@ final class ScedraLogicTests: XCTestCase {
         XCTAssertEqual(prepared.end, time(15))
         XCTAssertEqual(EventNotes.original(from: prepared.notes), "dentist tomorrow at 10")
 
+        XCTAssertFalse(EventScheduleEdit.locationTextChanged(from: "Westwind Community Barn", to: "Westwind Community Barn"))
+        XCTAssertFalse(EventScheduleEdit.locationTextChanged(from: "Barn", to: " Barn "))
+        XCTAssertFalse(EventScheduleEdit.locationTextChanged(from: nil, to: ""))
+        XCTAssertTrue(EventScheduleEdit.locationTextChanged(from: "Barn", to: "Westwind Community Barn"))
+        XCTAssertEqual(prepared.location, "Clinic", "a time-only prepare keeps the existing place")
+
         XCTAssertThrowsError(
             try EventScheduleEdit.prepare(item: item, officialStart: time(15), officialEnd: time(14))
         ) { error in
@@ -144,7 +150,8 @@ final class ScedraLogicTests: XCTestCase {
         let prepared = try EventScheduleEdit.prepare(
             item: item,
             officialStart: time(14),
-            officialEnd: time(15)
+            officialEnd: time(15),
+            placement: .partOfEvent
         )
         XCTAssertEqual(prepared.identifier, "ek-dinner")
         XCTAssertEqual(prepared.start, time(13, 35))
@@ -313,6 +320,16 @@ final class ScedraLogicTests: XCTestCase {
         XCTAssertEqual(calendar.component(.minute, from: draft.start), 30)
         XCTAssertEqual(draft.durationMinutes, 60)
         XCTAssertTrue(draft.durationAssumed)
+
+        XCTAssertTrue(draft.applyTypedStart("14"))
+        XCTAssertEqual(calendar.component(.hour, from: draft.start), 14, "bare 14 is 14:00, never 2 AM")
+        XCTAssertEqual(calendar.component(.minute, from: draft.start), 0)
+        let fourteenDisplay = draft.start.formatted(
+            Date.FormatStyle(date: .omitted, time: .shortened).locale(Locale(identifier: "en_US"))
+        )
+        XCTAssertTrue(fourteenDisplay.contains("2"), "14:00 should display as 2:00 PM, got \(fourteenDisplay)")
+        XCTAssertTrue(fourteenDisplay.lowercased().contains("pm"), fourteenDisplay)
+        XCTAssertFalse(fourteenDisplay.lowercased().contains("am"), fourteenDisplay)
 
         XCTAssertTrue(draft.applyTypedStart("6-9"))
         XCTAssertEqual(calendar.component(.hour, from: draft.start), 18)
@@ -513,6 +530,14 @@ final class ScedraLogicTests: XCTestCase {
         XCTAssertEqual(ReviewTimeTyping.parseAppointment("at 2"), .clock(hour: 14, minute: 0, resolved: true))
         XCTAssertEqual(ReviewTimeTyping.parseAppointment("10"), .clock(hour: 10, minute: 0, resolved: true))
         XCTAssertEqual(ReviewTimeTyping.parseAppointment("1am"), .clock(hour: 1, minute: 0, resolved: true))
+        XCTAssertEqual(ClockTimeParser.parse("14")?.hour, 14)
+        XCTAssertEqual(ClockTimeParser.parse("14")?.minute, 0)
+        XCTAssertEqual(ClockTimeParser.parse("14:00")?.hour, 14)
+        XCTAssertEqual(ClockTimeParser.parse("0")?.hour, 0)
+        XCTAssertEqual(ReviewTimeTyping.parseAppointment("14"), .clock(hour: 14, minute: 0, resolved: true))
+        XCTAssertEqual(ReviewTimeTyping.parseAppointment("14:00"), .clock(hour: 14, minute: 0, resolved: true))
+        XCTAssertEqual(ReviewTimeTyping.parseAppointment("0"), .clock(hour: 0, minute: 0, resolved: true))
+        XCTAssertNotEqual(ReviewTimeTyping.parseAppointment("14"), .clock(hour: 2, minute: 0, resolved: true))
 
         let twoThree = TimeRangeParser.parse("2-3")
         XCTAssertEqual(twoThree?.startHour, 14)
@@ -531,6 +556,43 @@ final class ScedraLogicTests: XCTestCase {
 
         let riding = EventExtractor.drafts(from: "riding today at 10")[0]
         XCTAssertEqual(Calendar.current.component(.hour, from: riding.start), 10)
+    }
+
+    func testBareFourteenIsTwoPMNotTwoAM() {
+        XCTAssertEqual(ClockTimeParser.parse("14")?.hour, 14)
+        XCTAssertEqual(ClockTimeParser.parse("14:00")?.hour, 14)
+        XCTAssertEqual(ClockTimeParser.parse("at 14")?.hour, 14)
+        XCTAssertEqual(ClockTimeParser.parse("dentist at 14")?.hour, 14)
+        XCTAssertNil(ClockTimeParser.parse("2026-09-14"), "a calendar day is not 2:00 PM")
+        XCTAssertEqual(TimeRangeParser.parse("14-16")?.startHour, 14)
+        XCTAssertEqual(TimeRangeParser.parse("14-16")?.endHour, 16)
+
+        let calendar = Calendar.current
+        var draft = DraftEvent(
+            title: "Dentist",
+            start: calendar.date(bySettingHour: 10, minute: 0, second: 0, of: Date())!,
+            durationMinutes: 60,
+            durationAssumed: true,
+            location: "",
+            sourceText: "dentist",
+            hasDate: true,
+            hasTime: true
+        )
+        XCTAssertTrue(draft.applyTypedStart("14"))
+        XCTAssertEqual(calendar.component(.hour, from: draft.start), 14)
+        XCTAssertEqual(calendar.component(.minute, from: draft.start), 0)
+        let display = draft.start.formatted(
+            Date.FormatStyle(date: .omitted, time: .shortened).locale(Locale(identifier: "en_US"))
+        )
+        let compact = display
+            .replacingOccurrences(of: "\u{202F}", with: " ")
+            .replacingOccurrences(of: "\u{00A0}", with: " ")
+        XCTAssertTrue(compact.contains("2"), "14:00 should display as 2:00 PM, got \(display)")
+        XCTAssertTrue(compact.lowercased().contains("pm"), display)
+        XCTAssertFalse(compact.lowercased().contains("am"), display)
+
+        let spoken = EventExtractor.drafts(from: "dentist tomorrow at 14")[0]
+        XCTAssertEqual(calendar.component(.hour, from: spoken.start), 14)
     }
 
     func testCalendarCardScreenshotKeepsTitleRangeAndAddress() {
@@ -1270,9 +1332,11 @@ final class ScedraLogicTests: XCTestCase {
     func testPhotoTranscriptDropsWeirdSymbols() {
         let raw = "Annual ★ Physical ◆ Exam\n• Check-in Time ¦ 2:15 PM\nAddress: 11800 Willow Road �"
         let cleaned = OCRTextNormalizer.readablePhotoTranscript(raw)
-        XCTAssertTrue(cleaned.localizedCaseInsensitiveContains("Annual Physical Exam"), cleaned)
+        XCTAssertTrue(cleaned.contains("Annual Physical Exam"), cleaned)
         XCTAssertTrue(cleaned.contains("2:15"), cleaned)
         XCTAssertTrue(cleaned.contains("11800"), cleaned)
+        XCTAssertTrue(cleaned.contains("PM"), cleaned)
+        XCTAssertFalse(cleaned.contains("Am"), cleaned)
         XCTAssertFalse(cleaned.contains("★"), cleaned)
         XCTAssertFalse(cleaned.contains("◆"), cleaned)
         XCTAssertFalse(cleaned.contains("¦"), cleaned)
@@ -1341,6 +1405,8 @@ final class ScedraLogicTests: XCTestCase {
             notes: "Weekly sync"
         )
         XCTAssertNil(foreign.originalText, "a non-Scedra event has no original to show")
+        XCTAssertNil(ReviewOriginal.presentation(for: foreign))
+        XCTAssertFalse(foreign.hasOriginal)
     }
 
     // MARK: - Drive there and back
@@ -1435,26 +1501,76 @@ final class ScedraLogicTests: XCTestCase {
         XCTAssertEqual(TravelEstimator.noRouteMessage, String(localized: "No drive time from Maps"))
     }
 
-    func testPreferredOriginUsesHomeForReviewPlanning() {
+    func testPreferredOriginUsesCurrentPinWhenSearchFromIsCurrent() {
         let applePark = CLLocation(latitude: 37.3349, longitude: -122.0090)
         let home = CLLocation(latitude: 37.4419, longitude: -122.1430)
 
-        XCTAssertFalse(TravelEstimator.shouldTrustCurrentFix(homeAddressIsSet: true, isSimulator: true))
+        XCTAssertTrue(
+            TravelEstimator.shouldTrustCurrentFix(
+                homeAddressIsSet: true,
+                isSimulator: false,
+                searchFrom: .currentLocation
+            )
+        )
         XCTAssertFalse(
-            TravelEstimator.shouldTrustCurrentFix(homeAddressIsSet: true, isSimulator: false),
-            "live GPS is leave-now later — Review planning uses Home"
+            TravelEstimator.shouldTrustCurrentFix(
+                homeAddressIsSet: true,
+                isSimulator: false,
+                searchFrom: .home
+            ),
+            "Search from Home still ignores live GPS when Home is set"
         )
         XCTAssertTrue(TravelEstimator.shouldTrustCurrentFix(homeAddressIsSet: false, isSimulator: true))
         XCTAssertTrue(TravelEstimator.shouldTrustCurrentFix(homeAddressIsSet: false, isSimulator: false))
 
-        let fromHome = TravelEstimator.preferredOrigin(current: applePark, home: home, currentIsTrusted: true)
+        let fromHere = TravelEstimator.preferredOrigin(
+            current: applePark,
+            home: home,
+            currentIsTrusted: true,
+            searchFrom: .currentLocation
+        )
+        XCTAssertEqual(fromHere?.coordinate.latitude, applePark.coordinate.latitude)
+        XCTAssertEqual(fromHere?.coordinate.longitude, applePark.coordinate.longitude)
+
+        let fromHome = TravelEstimator.preferredOrigin(
+            current: applePark,
+            home: home,
+            currentIsTrusted: true,
+            searchFrom: .home
+        )
         XCTAssertEqual(fromHome?.coordinate.latitude, home.coordinate.latitude)
         XCTAssertEqual(fromHome?.coordinate.longitude, home.coordinate.longitude)
+
+        let lastKnown = CLLocation(latitude: 37.45, longitude: -122.16)
+        let fromLastKnown = TravelEstimator.preferredOrigin(
+            current: nil,
+            home: home,
+            currentIsTrusted: false,
+            lastKnown: lastKnown,
+            searchFrom: .currentLocation
+        )
+        XCTAssertEqual(fromLastKnown?.coordinate.latitude ?? 0, lastKnown.coordinate.latitude, accuracy: 0.0001)
+
+        let fallbackHome = TravelEstimator.preferredOrigin(
+            current: nil,
+            home: home,
+            currentIsTrusted: false,
+            lastKnown: nil,
+            searchFrom: .currentLocation
+        )
+        XCTAssertEqual(fallbackHome?.coordinate.latitude ?? 0, home.coordinate.latitude, accuracy: 0.0001)
 
         let fromDevice = TravelEstimator.preferredOrigin(current: applePark, home: nil, currentIsTrusted: true)
         XCTAssertEqual(fromDevice?.coordinate.latitude, applePark.coordinate.latitude)
 
-        XCTAssertNil(TravelEstimator.preferredOrigin(current: applePark, home: nil, currentIsTrusted: false))
+        XCTAssertNil(
+            TravelEstimator.preferredOrigin(
+                current: applePark,
+                home: nil,
+                currentIsTrusted: false,
+                searchFrom: .home
+            )
+        )
 
         let appleParkFix = CLLocation(
             coordinate: applePark.coordinate,

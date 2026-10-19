@@ -17,6 +17,9 @@ enum TaskEditorSession: Identifiable {
         if case .create = self { return true }
         return false
     }
+
+    /// Creating a task is not completing it. Keep the toggle on edit.
+    var showsCompletedToggle: Bool { !isNew }
 }
 
 /// Starter rows for the empty Tasks tab. Titles become stored text once she saves.
@@ -67,6 +70,9 @@ struct TaskEditorView: View {
     @State private var hasSchedule: Bool
     @State private var confirmDelete = false
     @State private var overlapAlert = false
+    @State private var isSaving = false
+    @State private var isResolvingLocation = false
+    @State private var placeResolver = PlaceResolver()
 
     private enum Field: Hashable {
         case title, notes, location, category
@@ -162,7 +168,13 @@ struct TaskEditorView: View {
             labeledField("Notes", text: $draft.notes, field: .notes, prompt: "Notes (optional)", lines: 3...6)
             durationRow
             labeledField("Category", text: $draft.category, field: .category, prompt: "Category (optional)")
-            Toggle("Completed", isOn: $draft.isCompleted)
+            if session.showsCompletedToggle {
+                Toggle("Completed", isOn: $draft.isCompleted)
+                    .tint(ScedraTheme.purple)
+                    .font(.body.weight(.medium))
+                    .foregroundStyle(ScedraTheme.deepPurple)
+            }
+            Toggle("Important", isOn: importanceBinding)
                 .tint(ScedraTheme.purple)
                 .font(.body.weight(.medium))
                 .foregroundStyle(ScedraTheme.deepPurple)
@@ -232,6 +244,15 @@ struct TaskEditorView: View {
     private var placeCard: some View {
         VStack(alignment: .leading, spacing: 12) {
             labeledField("Location", text: $draft.location, field: .location, prompt: "Location (optional)")
+            if isResolvingLocation {
+                HStack(spacing: 8) {
+                    ProgressView()
+                        .tint(ScedraTheme.purple)
+                    Text("Finding nearby…")
+                }
+                .font(.caption)
+                .foregroundStyle(ScedraTheme.purple)
+            }
             Toggle("Requires travel", isOn: $draft.requiresTravel)
                 .tint(ScedraTheme.purple)
                 .font(.body.weight(.medium))
@@ -333,7 +354,7 @@ struct TaskEditorView: View {
                     .background(canSave ? ScedraTheme.purple : ScedraTheme.lavender, in: Capsule())
                     .foregroundStyle(canSave ? Color.white : ScedraTheme.deepPurple.opacity(0.5))
             }
-            .disabled(!canSave)
+            .disabled(!canSave || isSaving)
 
             if !session.isNew, onDelete != nil {
                 Button("Delete task", role: .destructive) {
@@ -361,6 +382,13 @@ struct TaskEditorView: View {
         )
     }
 
+    private var importanceBinding: Binding<Bool> {
+        Binding(
+            get: { draft.importance == .important },
+            set: { draft.importance = $0 ? .important : .normal }
+        )
+    }
+
     private func save() {
         var next = draft
         next.title = next.title.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -375,8 +403,26 @@ struct TaskEditorView: View {
             }
             next.applyPlacement(start: start)
         }
-        onSave(next)
-        dismiss()
+        isSaving = true
+        Task { @MainActor in
+            defer { isSaving = false; isResolvingLocation = false }
+            let query = next.location.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !query.isEmpty {
+                isResolvingLocation = true
+                if let place = await placeResolver.resolve(query) {
+                    next.location = place.displayLine
+                    PlaceMemory.remember(
+                        title: next.title,
+                        location: place.displayLine,
+                        latitude: place.latitude,
+                        longitude: place.longitude
+                    )
+                }
+                isResolvingLocation = false
+            }
+            onSave(next)
+            dismiss()
+        }
     }
 
     private var scheduledSlotConflicts: Bool {

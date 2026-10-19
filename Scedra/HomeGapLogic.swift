@@ -17,6 +17,10 @@ struct HomeGapStop: Equatable, Identifiable {
     var usesHome: Bool
     /// Original wording or portal notes — standing / what-to-bring can read these.
     var notes: String = ""
+    /// Linked Drive to / Drive home / Drive from blocks occupy time; they are not a stop at home.
+    var isDriveEvent: Bool = false
+    /// EventKit identifier — drive notes `For:` point at this, not `occurrenceKey`.
+    var calendarEventID: String = ""
 
     /// She is free to drive after the appointment plus typed After extra.
     var leaveAt: Date {
@@ -27,6 +31,11 @@ struct HomeGapStop: Equatable, Identifiable {
         let trimmed = place.trimmingCharacters(in: .whitespacesAndNewlines)
         if !trimmed.isEmpty { return trimmed }
         return usesHome ? ScedraString("Home") : title
+    }
+
+    /// Title or Scedra drive notes (`For:` / `Leg:` / drive marker).
+    var occupiesAsDrive: Bool {
+        isDriveEvent || DriveTimeLogic.isDriveEvent(title: title, notes: notes)
     }
 
     var coordinate: CLLocationCoordinate2D? {
@@ -155,7 +164,9 @@ enum HomeGapLogic {
         from stops: [HomeGapStop],
         calendar: Calendar = .current
     ) -> [(HomeGapStop, HomeGapStop)] {
-        let timed = stops.sorted { $0.officialStart < $1.officialStart }
+        let timed = stops
+            .filter { !$0.occupiesAsDrive }
+            .sorted { $0.officialStart < $1.officialStart }
         var pairs: [(HomeGapStop, HomeGapStop)] = []
         let grouped = Dictionary(grouping: timed) { calendar.startOfDay(for: $0.officialStart) }
         for day in grouped.values {
@@ -180,6 +191,7 @@ enum HomeGapLogic {
         preferTransit: Bool = false,
         minHomeMinutes: Int = 0,
         standingBring: [String] = [],
+        occupied: [HomeGapStop] = [],
         calendar: Calendar = .current
     ) -> HomeGapSuggestion? {
         if let overlap = overlapSuggestion(
@@ -238,9 +250,19 @@ enum HomeGapLogic {
         }
 
         if let aToHome = minutes.aToHome, let homeToB = minutes.homeToB {
-            let viaHomeNeeded = aToHome + homeToB + buffer + before
-            let atHome = minutesAtHome(
-                gap: gap,
+            let viaHomeNeeded = unfilledViaHomeMinutes(
+                first: first,
+                second: second,
+                occupied: occupied,
+                aToHome: aToHome,
+                homeToB: homeToB,
+                buffer: buffer,
+                before: before
+            )
+            let atHome = leftoverMinutesAtHome(
+                first: first,
+                second: second,
+                occupied: occupied,
                 aToHome: aToHome,
                 homeToB: homeToB,
                 buffer: buffer,
@@ -264,9 +286,19 @@ enum HomeGapLogic {
             }
 
             if let transitHome = minutes.aToHomeTransit, let transitBack = minutes.homeToBTransit {
-                let viaHomeTransit = transitHome + transitBack + buffer + before
-                let transitAtHome = minutesAtHome(
-                    gap: gap,
+                let viaHomeTransit = unfilledViaHomeMinutes(
+                    first: first,
+                    second: second,
+                    occupied: occupied,
+                    aToHome: transitHome,
+                    homeToB: transitBack,
+                    buffer: buffer,
+                    before: before
+                )
+                let transitAtHome = leftoverMinutesAtHome(
+                    first: first,
+                    second: second,
+                    occupied: occupied,
                     aToHome: transitHome,
                     homeToB: transitBack,
                     buffer: buffer,
@@ -317,6 +349,21 @@ enum HomeGapLogic {
         ScedraString("Only \(max(atHome, 0)) min at home (need \(max(minHome, 0))).")
     }
 
+    /// Same decision the day-chain uses: A→Home + min at home + Home→B must fit the gap.
+    static func canGoHome(
+        gap: Int,
+        aToHome: Int?,
+        homeToB: Int?,
+        minHomeMinutes: Int,
+        buffer: Int,
+        before: Int = 0
+    ) -> Bool {
+        guard let aToHome, let homeToB else { return false }
+        let needed = aToHome + homeToB + max(buffer, 0) + max(before, 0)
+        let atHome = gap - needed
+        return needed <= gap && atHome >= max(minHomeMinutes, 0)
+    }
+
     /// Minutes actually sitting at home if she takes the drive-home path.
     static func minutesAtHome(
         gap: Int,
@@ -326,6 +373,162 @@ enum HomeGapLogic {
         before: Int
     ) -> Int {
         gap - aToHome - homeToB - max(buffer, 0) - max(before, 0)
+    }
+
+    /// Leftover sitting-at-home minutes after real calendar blocks (including Drive
+    /// to / Drive home / Drive from) and any travel leg that is not already on the calendar.
+    static func leftoverMinutesAtHome(
+        first: HomeGapStop,
+        second: HomeGapStop,
+        occupied: [HomeGapStop] = [],
+        aToHome: Int,
+        homeToB: Int,
+        buffer: Int,
+        before: Int
+    ) -> Int {
+        let start = first.leaveAt
+        let end = second.officialStart
+        guard end > start else { return minutesAtHome(gap: 0, aToHome: aToHome, homeToB: homeToB, buffer: buffer, before: before) }
+
+        var busy: [(Date, Date)] = []
+        for stop in occupants(between: first, and: second, occupied: occupied) {
+            if stop.occupiesAsDrive {
+                busy.append((stop.officialStart, stop.officialEnd))
+            } else if stop.usesHome || looksLikeHome(stop.place) {
+                continue
+            } else {
+                busy.append((stop.officialStart, stop.officialEnd))
+            }
+        }
+
+        let onward = coveringOnwardDrive(first: first, second: second, occupied: occupied)
+        if let onward {
+            if onward.officialStart > start {
+                busy.append((start, onward.officialStart))
+            }
+        } else if aToHome > 0 {
+            busy.append((start, start.addingTimeInterval(TimeInterval(aToHome * 60))))
+        }
+
+        let inbound = coveringInboundDrive(first: first, second: second, occupied: occupied)
+        if let inbound {
+            if inbound.officialEnd < end {
+                busy.append((inbound.officialEnd, end))
+            }
+        } else {
+            let tail = max(homeToB, 0) + max(buffer, 0) + max(before, 0)
+            if tail > 0 {
+                let leaveHome = end.addingTimeInterval(TimeInterval(-tail * 60))
+                busy.append((leaveHome, end))
+            }
+        }
+
+        return freeMinutes(from: start, to: end, busy: busy)
+    }
+
+    /// MKDirections minutes still needed after drive siblings fill a leg.
+    static func unfilledViaHomeMinutes(
+        first: HomeGapStop,
+        second: HomeGapStop,
+        occupied: [HomeGapStop] = [],
+        aToHome: Int,
+        homeToB: Int,
+        buffer: Int,
+        before: Int
+    ) -> Int {
+        var needed = 0
+        if coveringOnwardDrive(first: first, second: second, occupied: occupied) == nil {
+            needed += max(aToHome, 0)
+        }
+        if coveringInboundDrive(first: first, second: second, occupied: occupied) == nil {
+            needed += max(homeToB, 0) + max(buffer, 0) + max(before, 0)
+        }
+        return needed
+    }
+
+    static func coveringOnwardDrive(
+        first: HomeGapStop,
+        second: HomeGapStop,
+        occupied: [HomeGapStop]
+    ) -> HomeGapStop? {
+        occupants(between: first, and: second, occupied: occupied)
+            .filter(\.occupiesAsDrive)
+            .filter { drive in
+                let leg = DriveTimeLogic.inferredLeg(title: drive.title, notes: drive.notes)
+                return leg == .onward
+                    && covers(drive, stop: first, asOnward: true)
+            }
+            .min { $0.officialStart < $1.officialStart }
+    }
+
+    static func coveringInboundDrive(
+        first: HomeGapStop,
+        second: HomeGapStop,
+        occupied: [HomeGapStop]
+    ) -> HomeGapStop? {
+        occupants(between: first, and: second, occupied: occupied)
+            .filter(\.occupiesAsDrive)
+            .filter { drive in
+                let leg = DriveTimeLogic.inferredLeg(title: drive.title, notes: drive.notes)
+                return leg == .inbound
+                    && covers(drive, stop: second, asOnward: false)
+            }
+            .max { $0.officialEnd < $1.officialEnd }
+    }
+
+    private static func occupants(
+        between first: HomeGapStop,
+        and second: HomeGapStop,
+        occupied: [HomeGapStop]
+    ) -> [HomeGapStop] {
+        occupied.filter { stop in
+            if stop.id == first.id || stop.id == second.id { return false }
+            return stop.officialEnd > first.leaveAt && stop.officialStart < second.officialStart
+        }
+    }
+
+    private static func covers(_ drive: HomeGapStop, stop: HomeGapStop, asOnward: Bool) -> Bool {
+        if let linked = DriveTimeLogic.appointmentIdentifier(fromDriveNotes: drive.notes) {
+            if !stop.calendarEventID.isEmpty, linked == stop.calendarEventID { return true }
+            return linked == stop.id
+        }
+        let adjacent: TimeInterval = 60
+        if asOnward {
+            return abs(drive.officialStart.timeIntervalSince(stop.leaveAt)) <= adjacent
+        }
+        return abs(drive.officialEnd.timeIntervalSince(stop.officialStart)) <= adjacent
+    }
+
+    private static func freeMinutes(from start: Date, to end: Date, busy: [(Date, Date)]) -> Int {
+        guard end > start else { return 0 }
+        let clipped = busy.compactMap { interval -> (Date, Date)? in
+            let s = max(interval.0, start)
+            let e = min(interval.1, end)
+            return e > s ? (s, e) : nil
+        }
+        .sorted { $0.0 < $1.0 }
+
+        var merged: [(Date, Date)] = []
+        for interval in clipped {
+            if let last = merged.last, interval.0 <= last.1 {
+                merged[merged.count - 1].1 = max(last.1, interval.1)
+            } else {
+                merged.append(interval)
+            }
+        }
+
+        var free = 0
+        var cursor = start
+        for interval in merged {
+            if interval.0 > cursor {
+                free += Int(interval.0.timeIntervalSince(cursor) / 60)
+            }
+            cursor = max(cursor, interval.1)
+        }
+        if end > cursor {
+            free += Int(end.timeIntervalSince(cursor) / 60)
+        }
+        return free
     }
 
     static func notifyDate(before first: HomeGapStop) -> Date {

@@ -92,6 +92,12 @@ enum HomeGapNotificationPlanner {
             )
             await HomeGapNotifier.reschedule(suggestions, now: now)
         }
+        await CalendarTravelBackfill.refresh(
+            items: calendar.events(on: now)
+                + calendar.events(on: tomorrow)
+                + calendar.events(on: calendar.selectedDay),
+            using: calendar
+        )
         await LeaveToNavigatePlanner.refresh(using: calendar, now: now)
     }
 }

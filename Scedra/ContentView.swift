@@ -42,34 +42,96 @@ enum CaptureMode: String, CaseIterable, Identifiable {
     }
 }
 
+private enum RootTab: Hashable {
+    case capture
+    case calendar
+    case tasks
+}
+
 struct RootView: View {
     @State private var calendar = CalendarStore()
     @State private var tasks = TaskRepository()
+    @State private var onboarding = OnboardingGuide()
+    @State private var tab: RootTab = .capture
     @AppStorage(ScedraThemeStore.key) private var themeID = ScedraThemeID.lavender.rawValue
+    @AppStorage(PlaceResolver.homeAddressKey) private var homeAddress = ""
 
     var body: some View {
-        TabView {
+        TabView(selection: $tab) {
             ContentView(calendar: calendar)
                 .tabItem {
                     Label("Capture", systemImage: "waveform")
                 }
+                .tag(RootTab.capture)
             CalendarTabView(calendar: calendar)
                 .tabItem {
                     Label("Calendar", systemImage: "calendar")
                 }
+                .tag(RootTab.calendar)
             TasksTabView(calendar: calendar, tasks: tasks)
                 .tabItem {
                     Label("Tasks", systemImage: "checkmark.circle")
                 }
+                .tag(RootTab.tasks)
         }
         .tint(ScedraTheme.palette(for: ScedraThemeID(rawValue: themeID) ?? .lavender).purple)
         // Phone language for chrome; Midnight dark is only the color scheme.
         .environment(\.locale, Locale.autoupdatingCurrent)
+        .environment(onboarding)
         .preferredColorScheme((ScedraThemeID(rawValue: themeID) ?? .lavender).preferredColorScheme)
+        .sheet(isPresented: Binding(
+            get: { onboarding.showsWelcome },
+            set: { if !$0 { onboarding.acknowledgeWelcome() } }
+        )) {
+            OnboardingWelcomeView {
+                onboarding.acknowledgeWelcome()
+            }
+        }
+        .onChange(of: onboarding.tabRequest) { _, request in
+            guard let request else { return }
+            switch request {
+            case .capture: tab = .capture
+            case .tasks: tab = .tasks
+            }
+            onboarding.consumeTabRequest()
+        }
+        .onChange(of: homeAddress) { _, newValue in
+            let trimmed = newValue.trimmingCharacters(in: .whitespacesAndNewlines)
+            onboarding.syncHome(isSet: !trimmed.isEmpty)
+        }
         .task {
+            calendar.deletedEventIDsHandler = { ids in
+                tasks.removeMatchingCalendarEvents(ids)
+            }
+            calendar.storeChangedHandler = {
+                tasks.removeTasksMissingFromCalendar(eventExists: calendar.eventExists)
+            }
+            calendar.savedAppointmentHandler = {
+                onboarding.markEventDone()
+            }
+            tasks.placedTaskHandler = {
+                onboarding.markTaskDone()
+            }
             await calendar.requestAccessAndLoad()
             await HomeGapNotifier.requestAuthorization()
             await LeaveToNavigateNotifier.requestAuthorization()
+            onboarding.seedIfNeeded(
+                homeIsSet: PlaceResolver.isHomeAddressSet,
+                hasScedraCreatedEvent: calendar.hasScedraCreatedEvent(),
+                hasTasks: !tasks.tasks.isEmpty
+            )
+            #if DEBUG
+            if DriveChainDemo.isRequested {
+                let day = await DriveChainDemo.seed(using: calendar)
+                calendar.selectedDay = Calendar.current.startOfDay(for: day)
+                calendar.loadSelectedDay()
+                tab = .calendar
+            }
+            if TimelineAccuracyDemo.isRequested {
+                _ = await TimelineAccuracyDemo.seed(using: calendar)
+                tab = .calendar
+            }
+            #endif
         }
     }
 }
@@ -77,6 +139,7 @@ struct RootView: View {
 struct ContentView: View {
     var calendar: CalendarStore
 
+    @Environment(OnboardingGuide.self) private var onboarding
     @AppStorage(UserProfile.nameKey) private var profileName = ""
     @State private var speech = SpeechCapture()
     @State private var mode: CaptureMode = .voice
@@ -116,27 +179,48 @@ struct ContentView: View {
     }
 
     var body: some View {
+        @Bindable var onboarding = onboarding
+        let walkthrough = onboarding.eventWalkthrough
+        let coachEpoch = onboarding.eventCoachEpoch
         NavigationStack {
             ZStack {
                 ScedraTheme.background.ignoresSafeArea()
 
-                ScrollView {
-                    VStack(alignment: .leading, spacing: 22) {
-                        Button {
-                            showSettings = true
-                        } label: {
-                            Text(greeting)
-                                .font(.system(size: 34, weight: .regular, design: .serif))
-                                .foregroundStyle(ScedraTheme.deepPurple)
+                ScrollViewReader { proxy in
+                    ScrollView {
+                        VStack(alignment: .leading, spacing: 22) {
+                            Button {
+                                showSettings = true
+                            } label: {
+                                Text(greeting)
+                                    .font(.system(size: 34, weight: .regular, design: .serif))
+                                    .foregroundStyle(ScedraTheme.deepPurple)
+                            }
+                            .buttonStyle(.plain)
+                            .accessibilityLabel(settingsGreetingLabel)
+                            if walkthrough == .saved {
+                                eventSavedCoachBanner
+                                    .id("onboarding-event-coach")
+                            }
+                            captureCard
+                                .id("onboarding-capture-card")
+                            todaySection
                         }
-                        .buttonStyle(.plain)
-                        .accessibilityLabel(settingsGreetingLabel)
-                        captureCard
-                        todaySection
+                        .padding(.horizontal, 20)
+                        .padding(.top, 8)
+                        .padding(.bottom, 28)
                     }
-                    .padding(.horizontal, 20)
-                    .padding(.top, 8)
-                    .padding(.bottom, 28)
+                    .onChange(of: walkthrough) { _, phase in
+                        scrollEventCoach(proxy: proxy, phase: phase)
+                    }
+                    .onChange(of: coachEpoch) { _, _ in
+                        scrollEventCoach(proxy: proxy, phase: walkthrough)
+                    }
+                    .onAppear {
+                        if walkthrough == .captureModes || walkthrough == .captureInput {
+                            scrollEventCoach(proxy: proxy, phase: walkthrough)
+                        }
+                    }
                 }
             }
             .navigationBarTitleDisplayMode(.inline)
@@ -169,6 +253,9 @@ struct ContentView: View {
             }) {
                 SettingsView()
             }
+            .onChange(of: onboarding.pendingOpenSettings) { _, pending in
+                if pending { presentOnboardingSettings() }
+            }
             .sheet(item: $selectedAppointment) { selected in
                 EventDetailsSheet(
                     item: selected.item,
@@ -181,11 +268,16 @@ struct ContentView: View {
             }
             .scedraDeleteConfirmation(item: $pendingDelete, onConfirm: delete)
             .onChange(of: showReview) { _, presented in
-                if !presented {
+                if presented {
+                    onboarding.advanceEventWalkthroughToReview()
+                } else {
                     calendar.loadToday()
                     if shouldClearComposerAfterReview {
                         shouldClearComposerAfterReview = false
                         clearComposerAfterSuccessfulSave()
+                        onboarding.advanceEventWalkthroughToSaved()
+                    } else {
+                        onboarding.retreatEventWalkthroughToCapture()
                     }
                 }
             }
@@ -193,6 +285,7 @@ struct ContentView: View {
                 if calendar.access == .full || calendar.access == .writeOnly {
                     calendar.loadToday()
                 }
+                presentOnboardingSettings()
             }
             .onChange(of: speech.transcript) { _, newValue in
                 if mode == .voice, !newValue.isEmpty {
@@ -205,8 +298,35 @@ struct ContentView: View {
         }
     }
 
+    private var captureHighlight: OnboardingCaptureHighlight? {
+        OnboardingCaptureCoach.highlight(
+            phase: onboarding.eventWalkthrough,
+            mode: mode
+        )
+    }
+
+    private func scrollEventCoach(proxy: ScrollViewProxy, phase: OnboardingEventWalkthrough?) {
+        guard let phase else { return }
+        Task { @MainActor in
+            withAnimation(.easeInOut(duration: 0.28)) {
+                switch phase {
+                case .captureModes, .captureInput:
+                    proxy.scrollTo("onboarding-capture-card", anchor: .top)
+                case .saved:
+                    proxy.scrollTo("onboarding-event-coach", anchor: .top)
+                case .review:
+                    break
+                }
+            }
+        }
+    }
+
     private var captureCard: some View {
         VStack(alignment: .leading, spacing: 16) {
+            if onboarding.eventWalkthrough == .captureModes || onboarding.eventWalkthrough == .captureInput {
+                captureCoachBar
+            }
+
             modePicker
 
             switch mode {
@@ -223,7 +343,7 @@ struct ContentView: View {
                     .font(.footnote)
                     .foregroundStyle(.red)
             }
-            if let savedBanner {
+            if let savedBanner, onboarding.eventWalkthrough != .saved {
                 Text(savedBanner)
                     .font(.footnote.weight(.medium))
                     .foregroundStyle(ScedraTheme.purple)
@@ -240,39 +360,73 @@ struct ContentView: View {
             .disabled(sourceText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || isReadingPhoto)
         }
         .scedraCard()
+        .animation(.easeInOut(duration: 0.28), value: onboarding.eventWalkthrough)
+    }
+
+    private var captureCoachBar: some View {
+        HStack(alignment: .center, spacing: 8) {
+            if onboarding.eventWalkthrough == .captureModes {
+                Text("Tap Voice, Photo, or Type")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(ScedraTheme.purple)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Spacer(minLength: 8)
+            OnboardingCoachSkipChip {
+                onboarding.skipEventWalkthrough()
+            }
+        }
     }
 
     private var modePicker: some View {
-        HStack(spacing: 6) {
-            ForEach(CaptureMode.allCases) { item in
-                Button {
-                    if item != .voice, speech.isListening {
-                        speech.cancel()
+        let highlightModes = captureHighlight == .modes
+        return VStack(spacing: 2) {
+            if highlightModes {
+                HStack(spacing: 6) {
+                    ForEach(CaptureMode.allCases) { _ in
+                        OnboardingCoachArrow(size: 14)
+                            .frame(maxWidth: .infinity)
                     }
-                    if item != .photo {
-                        abandonInFlightPhotoRead()
-                    }
-                    mode = item
-                    captureError = nil
-                } label: {
-                    Label(item.title, systemImage: item.icon)
-                        .font(.subheadline.weight(.semibold))
-                        .labelStyle(.titleAndIcon)
-                        .frame(maxWidth: .infinity)
-                        .padding(.vertical, 10)
-                        .background(mode == item ? ScedraTheme.purple : Color.clear, in: Capsule())
-                        .foregroundStyle(mode == item ? .white : ScedraTheme.deepPurple)
                 }
-                .buttonStyle(.plain)
+                .padding(.bottom, 2)
+            }
+            HStack(spacing: 6) {
+                ForEach(CaptureMode.allCases) { item in
+                    Button {
+                        if item != .voice, speech.isListening {
+                            speech.cancel()
+                        }
+                        if item != .photo {
+                            abandonInFlightPhotoRead()
+                        }
+                        mode = item
+                        captureError = nil
+                        onboarding.noteCaptureModePicked()
+                    } label: {
+                        Label(item.title, systemImage: item.icon)
+                            .font(.subheadline.weight(.semibold))
+                            .labelStyle(.titleAndIcon)
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 10)
+                            .background(mode == item ? ScedraTheme.purple : Color.clear, in: Capsule())
+                            .foregroundStyle(mode == item ? .white : ScedraTheme.deepPurple)
+                    }
+                    .buttonStyle(.plain)
+                    .onboardingCoachPulse(isActive: highlightModes)
+                }
+            }
+            .padding(6)
+            .background {
+                Capsule().fill(ScedraTheme.lavender.opacity(0.55))
             }
         }
-        .padding(4)
-        .background(ScedraTheme.lavender.opacity(0.55), in: Capsule())
+        .id(onboarding.eventCoachEpoch)
     }
 
     private var voiceBody: some View {
         VStack(alignment: .leading, spacing: 12) {
             Button {
+                onboarding.noteCaptureModePicked()
                 Task {
                     if speech.isListening {
                         speech.stop()
@@ -294,6 +448,7 @@ struct ContentView: View {
                 .foregroundStyle(speech.isListening ? .white : ScedraTheme.deepPurple)
             }
             .buttonStyle(.plain)
+            .onboardingCoachPulse(isActive: captureHighlight == .voice, showsArrow: true)
 
             if speech.isListening {
                 HStack(spacing: 8) {
@@ -344,6 +499,7 @@ struct ContentView: View {
             // "choose another" path while confirmation, OCR, or an error is up.
             if !photoSession.canCancel {
                 Button {
+                    onboarding.noteCaptureModePicked()
                     prepareToChooseAnotherPhoto()
                 } label: {
                     HStack {
@@ -357,6 +513,7 @@ struct ContentView: View {
                     .foregroundStyle(ScedraTheme.deepPurple)
                 }
                 .buttonStyle(.plain)
+                .onboardingCoachPulse(isActive: captureHighlight == .photo, showsArrow: true)
             }
 
             if let photoImage {
@@ -393,6 +550,11 @@ struct ContentView: View {
                 .padding(12)
                 .background(ScedraTheme.blush, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
                 .id(composerFieldID)
+                .onboardingCoachPulse(
+                    isActive: captureHighlight == .photo && photoSession.canCancel,
+                    cornerRadius: 16,
+                    showsArrow: true
+                )
         }
         .photosPicker(
             isPresented: $showPhotoPicker,
@@ -412,10 +574,20 @@ struct ContentView: View {
             .padding(12)
             .background(ScedraTheme.blush, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
             .id(composerFieldID)
+            .onboardingCoachPulse(
+                isActive: captureHighlight == .typeField,
+                cornerRadius: 16,
+                showsArrow: true
+            )
     }
 
     private var todaySection: some View {
         VStack(alignment: .leading, spacing: 12) {
+            if onboarding.showsChecklist {
+                OnboardingChecklistView(guide: onboarding)
+                    .transition(.opacity.combined(with: .move(edge: .top)))
+            }
+
             Text("Today")
                 .font(.system(size: 20, weight: .semibold, design: .serif))
                 .foregroundStyle(ScedraTheme.deepPurple)
@@ -454,6 +626,7 @@ struct ContentView: View {
                     .foregroundStyle(.red)
             }
         }
+        .animation(.easeInOut(duration: 0.28), value: onboarding.showsChecklist)
     }
 
     private func todayPlaceholder(_ text: String) -> some View {
@@ -462,6 +635,18 @@ struct ContentView: View {
             .foregroundStyle(.secondary)
             .frame(maxWidth: .infinity, alignment: .leading)
             .scedraCard()
+    }
+
+    private var eventSavedCoachBanner: some View {
+        OnboardingCoachBanner(message: "It's on Calendar and Today.") {
+            onboarding.skipEventWalkthrough()
+        }
+    }
+
+    private func presentOnboardingSettings() {
+        guard onboarding.pendingOpenSettings else { return }
+        onboarding.consumePendingOpenSettings()
+        showSettings = true
     }
 
     /// Confirm already wrote the EventKit event. Empty type / voice / photo
@@ -510,6 +695,7 @@ struct ContentView: View {
             return OriginalImageStore.save(photoImage)
         }()
         drafts = ReviewOriginal.attaching(imageURL: imageURL, to: parsed)
+        onboarding.advanceEventWalkthroughToReview()
         showReview = true
     }
 

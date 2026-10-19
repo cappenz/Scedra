@@ -16,7 +16,7 @@ enum OCRTextNormalizer {
         value = value.replacingOccurrences(of: "\u{2011}", with: "-")
         value = value.replacingOccurrences(of: "\u{2212}", with: "-")
         value = value.replacingOccurrences(of: #"[^\S\n]*:[^\S\n]*"#, with: ":", options: .regularExpression)
-        value = value.replacingOccurrences(of: #"(?i)\b([ap])\s*\.?\s*m\.?\b"#, with: "$1m", options: .regularExpression)
+        value = value.replacingOccurrences(of: #"(?i)\b([ap])\s*\.?\s*m(?:\.|\b)"#, with: "$1m", options: .regularExpression)
         // Vision often reads PM as PN / P.N.
         value = value.replacingOccurrences(of: #"(?i)\b([ap])\s*\.?\s*n\.?\b"#, with: "$1m", options: .regularExpression)
         // Street numbers glued to the name: "12344Elm" → "12344 Elm". Safe for speech.
@@ -63,29 +63,17 @@ enum OCRTextNormalizer {
         "%", "$", "*", "°", "~", "=", "'"
     ]
 
-    /// Vision output only: keep real line breaks, spaces between words, and
-    /// conservative de-glue so a human can read the portal page.
-    /// Spoken phrases must not go through here — camelCase split would break McDonald's.
+    /// Vision output only: drop OCR chrome so Review can show the page as scanned.
+    /// Do not rewrite words or casing — "Book Fair", "Annual", and "AM" stay as OCR'd.
+    /// Portal de-glue and known-word repair happen in `normalize` for parsing, not here.
     static func readablePhotoTranscript(_ text: String) -> String {
         var value = text
-        value = value.replacingOccurrences(
-            of: #"(?<=[a-z])(?=[A-Z])"#,
-            with: " ",
-            options: .regularExpression
-        )
-        value = value.replacingOccurrences(
-            of: #"(?<=\d)(?=[A-Za-z])"#,
-            with: " ",
-            options: .regularExpression
-        )
-        value = value.replacingOccurrences(
-            of: #"(\d{2,})([A-Za-z])"#,
-            with: "$1 $2",
-            options: .regularExpression
-        )
-        value = normalize(value)
+        let spaces = ["\u{00A0}", "\u{202F}", "\u{2007}", "\u{2009}", "\u{200A}", "\u{2060}"]
+        for space in spaces {
+            value = value.replacingOccurrences(of: space, with: " ")
+        }
         value = stripWeirdSymbols(value)
-        return CalendarCardParser.lineated(value)
+        return value
             .components(separatedBy: .newlines)
             .map { $0.replacingOccurrences(of: #" {2,}"#, with: " ", options: .regularExpression) }
             .map { $0.trimmingCharacters(in: .whitespaces) }
@@ -335,15 +323,21 @@ enum OCRTextNormalizer {
         if core.dropFirst().contains(where: \.isUppercase) { return token }
 
         let letters = core.lowercased().filter { $0.isLetter || $0.isNumber }
+        // Already one known word: keep OCR casing. Lowercasing here turned
+        // "Annual"/"Appointment" into "annual"/"appointment" because folded
+        // lookup then missed the doubled letters in the real spelling.
         if chatLexicon.contains(letters) {
-            return String(prefix) + letters + suffix
+            return token
         }
         let folded = foldedLetters(core)
         if let mapped = knownWords[folded] ?? (chatLexicon.contains(folded) ? folded : nil) {
             return String(prefix) + mapped + suffix
         }
+        // Only collapse extra consecutive letters ("heey", "okkk") — not
+        // subsequence guesses, which turned "Book" into "ok".
+        let letterChars = Array(letters)
         if let greeting = chatGreetingRepairs.first(where: {
-            fuzzyToken(core, matches: $0) && folded.count <= $0.count + 3
+            consumeLexiconWord($0, in: letterChars, at: 0) == letterChars.count
         }) {
             return String(prefix) + greeting + suffix
         }
@@ -954,8 +948,14 @@ enum CalendarCardParser {
             return letters.count == word.filter { $0.isLetter || $0 == "-" }.count && letters.count >= 2
         }
         guard lettersOnly else { return false }
-        let clinic = ["health", "family", "clinic", "hospital", "medical", "dental", "park", "road"]
-        if words.contains(where: { clinic.contains($0.lowercased()) }) { return false }
+        // "Book Fair" / "Central Library" are events and places, not two given names.
+        let notAName = [
+            "fair", "festival", "show", "exam", "concert", "market", "sale",
+            "library", "museum", "school", "church", "center", "centre", "hall",
+            "barn", "office", "store", "shop", "cafe", "appointment", "physical",
+            "health", "family", "clinic", "hospital", "medical", "dental", "park", "road"
+        ]
+        if words.contains(where: { notAName.contains($0.lowercased()) }) { return false }
         return words.allSatisfy { $0.first?.isUppercase == true }
     }
 
@@ -1147,21 +1147,50 @@ enum CalendarCardParser {
             options: [],
             range: NSRange(location: 0, length: nsText.length)
         ) ?? []
-        let dated = matches.filter { $0.resultType.contains(.date) && $0.date != nil }
+        let timeRange = TimeRangeParser.parse(text)
+        let dated = matches.filter { match in
+            guard match.resultType.contains(.date), match.date != nil else { return false }
+            guard NSMaxRange(match.range) <= nsText.length else { return false }
+            guard let timeRange else { return true }
+            if NSIntersectionRange(match.range, timeRange.nsRange).length == 0 { return true }
+            let snippet = nsText.substring(with: match.range)
+            if looksLikeWrittenMonthOrSlash(snippet) { return true }
+            return !isBareNumericClockRange(snippet)
+        }
         if let calendarDay = dated.first(where: { looksLikeCalendarDay($0, in: nsText) })?.date {
             return calendar.startOfDay(for: calendarDay)
+        }
+        let folded = text.lowercased()
+        for item in weekdayNames where folded.range(of: "\\b\(item.name)\\b", options: .regularExpression) != nil {
+            return nextWeekday(item.weekday, calendar: calendar)
         }
         return dated.first?.date
     }
 
     private static func looksLikeCalendarDay(_ match: NSTextCheckingResult, in text: NSString) -> Bool {
-        let snippet = text.substring(with: match.range).lowercased()
-        if snippet.range(of: cardDatePattern, options: .regularExpression) != nil { return true }
-        let months = [
-            "jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "sept",
-            "oct", "nov", "dec", "today", "tomorrow", "tonight", "yesterday"
-        ]
-        return months.contains { snippet.contains($0) }
+        let snippet = text.substring(with: match.range)
+        if looksLikeWrittenMonthOrSlash(snippet) { return true }
+        let folded = snippet.lowercased()
+        if folded.range(of: cardDatePattern, options: .regularExpression) != nil { return true }
+        let relatives = ["today", "tomorrow", "tonight", "yesterday"]
+        return relatives.contains { folded.contains($0) }
+    }
+
+    static func isBareNumericClockRange(_ snippet: String) -> Bool {
+        snippet.range(
+            of: #"^\s*(?:from\s+)?\d{1,2}(?::\d{2})?\s*(?:-|–|—|\bto\b)\s*\d{1,2}(?::\d{2})?\s*$"#,
+            options: [.regularExpression, .caseInsensitive]
+        ) != nil
+    }
+
+    /// "June 9" and "6/9" are dates. Bare "6-9" is not — that is an evening window.
+    static func looksLikeWrittenMonthOrSlash(_ snippet: String) -> Bool {
+        snippet.range(
+            of: #"(?i)\b(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\b"#,
+            options: .regularExpression
+        ) != nil
+            || snippet.range(of: #"\b\d{1,2}/\d{1,2}(?:/\d{2,4})?\b"#, options: .regularExpression) != nil
+            || snippet.range(of: #"\b\d{4}-\d{1,2}-\d{1,2}\b"#, options: .regularExpression) != nil
     }
 
     private static func detectedAddress(in text: String) -> String? {

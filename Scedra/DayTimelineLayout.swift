@@ -6,12 +6,13 @@ import Foundation
 struct DayTimelineMetrics: Equatable {
     /// Height of one hour row.
     var hourHeight: CGFloat
-    /// Shortest a block may be drawn, so a 15-minute event stays readable and tappable.
+    /// Visibility floor for zero- or one-minute pings only. Anything longer than
+    /// this is drawn at its true length, so a block's bottom is its end time.
     var minimumBlockHeight: CGFloat
     /// Gap between blocks sitting side by side in an overlapping cluster.
     var columnSpacing: CGFloat
 
-    init(hourHeight: CGFloat = 58, minimumBlockHeight: CGFloat = 30, columnSpacing: CGFloat = 4) {
+    init(hourHeight: CGFloat = 58, minimumBlockHeight: CGFloat = 2, columnSpacing: CGFloat = 4) {
         self.hourHeight = hourHeight
         self.minimumBlockHeight = minimumBlockHeight
         self.columnSpacing = columnSpacing
@@ -31,11 +32,10 @@ struct DayTimelineMetrics: Equatable {
         min(max(length(forSeconds: date.timeIntervalSince(dayStart)), 0), totalHeight)
     }
 
-    /// Drawn height of a duration, never below `minimumBlockHeight` or the
-    /// space the block's own title/time/location need. Extra height grows
-    /// downward from the real start; EventKit times are not moved.
-    func height(forSeconds seconds: TimeInterval, contentMinimum: CGFloat = 0) -> CGFloat {
-        max(length(forSeconds: max(seconds, 0)), minimumBlockHeight, contentMinimum)
+    /// Drawn height of a duration: the same points-per-minute as the hour rules.
+    /// Short events shrink their label to fit; they never grow past their end.
+    func height(forSeconds seconds: TimeInterval) -> CGFloat {
+        max(length(forSeconds: max(seconds, 0)), minimumBlockHeight)
     }
 }
 
@@ -45,16 +45,6 @@ struct TimelineSpan: Identifiable, Equatable {
     let id: String
     let start: Date
     let end: Date
-    /// Extra floor so title, time, and location fit inside the bubble when
-    /// the appointment itself is shorter than that text.
-    let contentMinimumHeight: CGFloat
-
-    init(id: String, start: Date, end: Date, contentMinimumHeight: CGFloat = 0) {
-        self.id = id
-        self.start = start
-        self.end = end
-        self.contentMinimumHeight = contentMinimumHeight
-    }
 }
 
 /// Where one event block lands: vertical position, height, and which slice of
@@ -74,28 +64,6 @@ struct TimelineBlockLayout: Identifiable, Equatable {
 
     var bottom: CGFloat { top + height }
 
-    func withHeight(_ height: CGFloat) -> TimelineBlockLayout {
-        TimelineBlockLayout(
-            id: id,
-            top: top,
-            height: height,
-            column: column,
-            columnCount: columnCount,
-            continuesBeforeDay: continuesBeforeDay,
-            continuesAfterDay: continuesAfterDay
-        )
-    }
-
-    /// True when the two blocks occupy overlapping slices of the lane, so
-    /// growing one downward would paint over the other.
-    func sharesHorizontalLane(with other: TimelineBlockLayout) -> Bool {
-        let left = CGFloat(column) / CGFloat(max(columnCount, 1))
-        let right = CGFloat(column + 1) / CGFloat(max(columnCount, 1))
-        let otherLeft = CGFloat(other.column) / CGFloat(max(other.columnCount, 1))
-        let otherRight = CGFloat(other.column + 1) / CGFloat(max(other.columnCount, 1))
-        return left < otherRight && otherLeft < right
-    }
-
     func xOffset(inLaneWidth laneWidth: CGFloat) -> CGFloat {
         laneWidth / CGFloat(max(columnCount, 1)) * CGFloat(column)
     }
@@ -109,45 +77,67 @@ struct TimelineBlockLayout: Identifiable, Equatable {
 /// Which pieces of chrome fit legibly inside a drawn block. Kept out of the view
 /// so the thresholds can be checked without rendering anything.
 struct TimelineBlockChrome: Equatable {
-    /// The start–end line under the title.
+    /// One line — title then time — in a smaller font, for blocks too short to
+    /// stack title over time. The block keeps its true height; the text shrinks.
+    let isCompact: Bool
+    /// The start–end text: its own line, or inline after the title when compact.
     let showsTime: Bool
     let showsLocation: Bool
     /// The tappable trash glyph. Delete must never be long-press-only when it fits.
     let showsDelete: Bool
+    /// Point size for the compact single line, fitted to the block's height.
+    let compactFontSize: CGFloat
+    /// Trash glyph point size; compact blocks get a smaller, background-free glyph.
+    let deleteGlyphSize: CGFloat
 
-    /// Shortest block that can still hold a legible, tappable trash glyph. Matches
-    /// `DayTimelineMetrics.minimumBlockHeight`, so every block drawn at the floor
-    /// still gets one.
-    static let deleteMinimumHeight: CGFloat = 30
-    /// Title plus the start–end line, including the block's vertical padding.
-    static let timeMinimumHeight: CGFloat = 46
-    /// Title, time, and a single location line without painting past the bubble.
-    static let locationMinimumHeight: CGFloat = 68
+    /// Title (12pt) over the start–end line (10pt), plus 4pt top and bottom padding.
+    static let timeMinimumHeight: CGFloat = 36
+    /// Title, time, and one location line.
+    static let locationMinimumHeight: CGFloat = 50
+    /// Room for the title to wrap to two lines above time and location.
+    static let twoLineTitleMinimumHeight: CGFloat = 64
+    /// Shortest block (about 11 minutes) whose trash glyph is still legible.
+    /// Anything shorter keeps delete in the long-press menu.
+    static let deleteMinimumHeight: CGFloat = 11
     /// Below this a block is a sliver in a crowded cluster; the glyph would cover
     /// the title, so the context menu carries delete on its own.
     static let deleteMinimumWidth: CGFloat = 74
     static let detailMinimumWidth: CGFloat = 110
+    /// Trailing room the trash takes in a regular block / a compact block.
+    static let deleteReserve: CGFloat = 28
+    static let compactDeleteReserve: CGFloat = 22
+    static let compactVerticalPadding: CGFloat = 1.5
+    /// Below this (about 8 minutes) even 7pt text would be sliced by the clip,
+    /// so the block is just its outline and accent bar; tap still opens details.
+    static let compactTextMinimumHeight: CGFloat = 8
 
     static func forBlock(height: CGFloat, width: CGFloat) -> TimelineBlockChrome {
-        TimelineBlockChrome(
-            showsTime: height >= timeMinimumHeight && width >= detailMinimumWidth,
-            showsLocation: height >= locationMinimumHeight && width >= detailMinimumWidth,
-            showsDelete: height >= deleteMinimumHeight && width >= deleteMinimumWidth
+        let compact = height < timeMinimumHeight
+        let wide = width >= detailMinimumWidth
+        return TimelineBlockChrome(
+            isCompact: compact,
+            showsTime: wide,
+            showsLocation: !compact && wide && height >= locationMinimumHeight,
+            showsDelete: height >= deleteMinimumHeight && width >= deleteMinimumWidth,
+            compactFontSize: compactFontSize(height: height),
+            deleteGlyphSize: compact ? min(max(height - 4, 7), 11) : 11
         )
     }
 
-    /// Height the bubble should grow to so the chrome it wants can sit inside
-    /// the rounded rect. Used as `TimelineSpan.contentMinimumHeight`.
-    static func contentMinimumHeight(showsTime: Bool, showsLocation: Bool) -> CGFloat {
-        if showsLocation { return locationMinimumHeight }
-        if showsTime { return timeMinimumHeight }
-        return deleteMinimumHeight
+    /// Largest font (7–11pt) whose single line fits inside `height`.
+    static func compactFontSize(height: CGFloat) -> CGFloat {
+        let available = height - compactVerticalPadding * 2
+        return min(max((available / 1.2).rounded(.down), 7), 11)
+    }
+
+    static func titleLineLimit(height: CGFloat) -> Int {
+        height >= twoLineTitleMinimumHeight ? 2 : 1
     }
 
     /// Title / time / location column inside a card of `cardWidth`.
-    /// Leading pad 6 + accent bar 3 + gap 6 + trailing pad (28 with trash, else 6).
-    static func textWidth(cardWidth: CGFloat, reservesDeleteSpace: Bool) -> CGFloat {
-        let trailing: CGFloat = reservesDeleteSpace ? 28 : 6
+    /// Leading pad 6 + accent bar 3 + gap 6 + trailing pad (trash reserve, else 6).
+    static func textWidth(cardWidth: CGFloat, reservesDeleteSpace: Bool, compact: Bool = false) -> CGFloat {
+        let trailing: CGFloat = reservesDeleteSpace ? (compact ? compactDeleteReserve : deleteReserve) : 6
         let used: CGFloat = 6 + 3 + 6 + trailing
         return max(cardWidth - used, 0)
     }
@@ -169,17 +159,12 @@ enum DayTimelineLayout {
         guard !clipped.isEmpty else { return [] }
 
         var result: [TimelineBlockLayout] = []
-        var durationFloors: [String: CGFloat] = [:]
         for cluster in clusters(of: clipped) {
             let columns = assignColumns(in: cluster)
             let columnCount = max(columns.max().map { $0 + 1 } ?? 1, 1)
             for (index, piece) in cluster.enumerated() {
-                let durationHeight = metrics.height(forSeconds: piece.end.timeIntervalSince(piece.start))
-                let height = metrics.height(
-                    forSeconds: piece.end.timeIntervalSince(piece.start),
-                    contentMinimum: piece.contentMinimumHeight
-                )
-                // A minimum-height block near midnight would hang off the grid, so pull it back up.
+                let height = metrics.height(forSeconds: piece.end.timeIntervalSince(piece.start))
+                // A floor-height ping at 11:59 PM would hang off the grid, so pull it back up.
                 let rawTop = metrics.offset(for: piece.start, dayStart: dayStart)
                 let top = max(min(rawTop, metrics.totalHeight - height), 0)
                 result.append(
@@ -193,36 +178,9 @@ enum DayTimelineLayout {
                         continuesAfterDay: piece.continuesAfter
                     )
                 )
-                durationFloors[piece.id] = durationHeight
             }
         }
-        return capContentGrowth(result, durationFloors: durationFloors)
-    }
-
-    /// Content-min extra height grows down from the real start. If that would
-    /// paint over a later block in the same lane, stop at that block's top —
-    /// time-overlapping neighbours already sit in different columns, so they
-    /// keep the existing side-by-side layout.
-    private static func capContentGrowth(
-        _ blocks: [TimelineBlockLayout],
-        durationFloors: [String: CGFloat]
-    ) -> [TimelineBlockLayout] {
-        blocks.map { block in
-            let floor = durationFloors[block.id] ?? block.height
-            guard block.height > floor + 0.01 else { return block }
-            let nextTop = blocks
-                .filter { other in
-                    other.id != block.id
-                        && other.top > block.top + 0.5
-                        && block.sharesHorizontalLane(with: other)
-                }
-                .map(\.top)
-                .min()
-            guard let nextTop else { return block }
-            let room = nextTop - block.top
-            let capped = max(floor, min(block.height, room))
-            return abs(capped - block.height) < 0.01 ? block : block.withHeight(capped)
-        }
+        return result
     }
 
     /// The hour to rest on when the day first appears: the current hour on
@@ -260,7 +218,6 @@ enum DayTimelineLayout {
         let end: Date
         let continuesBefore: Bool
         let continuesAfter: Bool
-        let contentMinimumHeight: CGFloat
     }
 
     /// Trims spans to the day's boundaries, dropping anything that never lands
@@ -277,8 +234,7 @@ enum DayTimelineLayout {
                 start: start,
                 end: end,
                 continuesBefore: span.start < dayStart,
-                continuesAfter: rawEnd > dayEnd,
-                contentMinimumHeight: span.contentMinimumHeight
+                continuesAfter: rawEnd > dayEnd
             )
         }
         .sorted { lhs, rhs in

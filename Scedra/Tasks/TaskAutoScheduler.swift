@@ -129,6 +129,45 @@ struct DefaultTaskAutoScheduler: TaskAutoScheduler {
     }
 }
 
+enum TaskPriority {
+    /// Important first, then closer deadline. Used to pick who gets the next good slot.
+    static func compare(_ lhs: ScedraTask, _ rhs: ScedraTask) -> Bool {
+        if lhs.importance != rhs.importance {
+            return lhs.importance == .important
+        }
+        switch (lhs.deadline, rhs.deadline) {
+        case let (left?, right?) where left != right:
+            return left < right
+        case (_?, nil):
+            return true
+        case (nil, _?):
+            return false
+        default:
+            return lhs.createdAt < rhs.createdAt
+        }
+    }
+
+    /// A less-important Scedra task may be bumped, and a later deadline may yield to a
+    /// closer one of the same importance. Calendar appointments never move.
+    static func canDisplace(_ incoming: ScedraTask, occupant: ScedraTask) -> Bool {
+        if incoming.id == occupant.id { return false }
+        if incoming.importance == .important && occupant.importance != .important {
+            return true
+        }
+        if incoming.importance != occupant.importance {
+            return false
+        }
+        switch (incoming.deadline, occupant.deadline) {
+        case let (left?, right?) where left < right:
+            return true
+        case (_?, nil):
+            return true
+        default:
+            return false
+        }
+    }
+}
+
 enum TaskPlacement {
     /// Keep a still-valid slot. Otherwise ask the scheduler. Never invent a 3am placeholder.
     static func refreshed(
@@ -178,5 +217,80 @@ enum TaskPlacement {
     /// Manual park. Same exclusive buffer as auto-placement. Does not move neighbors.
     static func manualSlotFits(_ task: ScedraTask, start: Date, busy: [TaskBusyBlock]) -> Bool {
         TaskAvailability.evaluatePlacement(task: task, start: start, busy: busy) != .doesNotFit
+    }
+
+    static func occupancyBlock(for task: ScedraTask) -> TaskBusyBlock? {
+        guard let start = task.scheduledStart, let end = task.scheduledEnd else { return nil }
+        return TaskBusyBlock(
+            start: start,
+            end: end,
+            kind: .focusedWork,
+            title: task.title,
+            isExclusiveTaskPlacement: task.allowedOverlaps.isEmpty,
+            isTaskPlacement: true
+        )
+    }
+
+    /// Places open tasks in priority order. An important task may take a normal task’s
+    /// slot; the bumped task is re-placed later. Calendar busy never moves.
+    static func schedulePrioritized(
+        _ tasks: [ScedraTask],
+        calendarBusy: [TaskBusyBlock],
+        now: Date,
+        scheduler: any TaskAutoScheduler = DefaultTaskAutoScheduler(),
+        honoring honoredID: UUID? = nil
+    ) -> [ScedraTask] {
+        var scheduled = Dictionary(uniqueKeysWithValues: tasks.map { ($0.id, $0) })
+        for task in tasks.sorted(by: TaskPriority.compare) {
+            guard var next = scheduled[task.id], !next.isCompleted else { continue }
+            let others = scheduled.values.filter { $0.id != next.id && !$0.isCompleted && $0.isPlaced }
+            let immovable = others.filter { !TaskPriority.canDisplace(next, occupant: $0) }
+            let busy = calendarBusy + immovable.compactMap(occupancyBlock)
+
+            let keepHonor = honoredID == next.id
+                && next.isPlaced
+                && next.scheduledStart.map { manualSlotFits(next, start: $0, busy: busy) } == true
+            if keepHonor, let start = next.scheduledStart {
+                let competes = next.importance == .important
+                    || others.contains { TaskPriority.canDisplace(next, occupant: $0) }
+                if competes,
+                   let better = scheduler.proposedStart(for: next, busy: busy, now: now),
+                   better < start {
+                    next.applyPlacement(start: better)
+                } else {
+                    next.applyPlacement(start: start)
+                }
+            } else {
+                var candidate = next
+                if !placementStillValid(candidate, busy: busy, now: now) {
+                    candidate.clearPlacementTimes()
+                }
+                if let start = scheduler.proposedStart(for: candidate, busy: busy, now: now) {
+                    let currentInvalid = !placementStillValid(next, busy: busy, now: now)
+                    let competes = next.importance == .important
+                        || others.contains { TaskPriority.canDisplace(next, occupant: $0) }
+                    let better = competes && (next.scheduledStart.map { start < $0 } ?? true)
+                    if currentInvalid || better {
+                        next.applyPlacement(start: start)
+                    }
+                } else if !placementStillValid(next, busy: busy, now: now) {
+                    next.clearPlacementTimes()
+                }
+            }
+            scheduled[next.id] = next
+
+            guard next.isPlaced else { continue }
+            let afterBusy = calendarBusy + scheduled.values
+                .filter { $0.id != next.id && $0.isPlaced && !TaskPriority.canDisplace(next, occupant: $0) }
+                .compactMap(occupancyBlock)
+                + [occupancyBlock(for: next)].compactMap { $0 }
+            for occupant in others where TaskPriority.canDisplace(next, occupant: occupant) {
+                guard var bumped = scheduled[occupant.id], bumped.isPlaced else { continue }
+                if placementStillValid(bumped, busy: afterBusy, now: now) { continue }
+                bumped.clearPlacementTimes()
+                scheduled[bumped.id] = refreshed(bumped, busy: afterBusy, now: now, scheduler: scheduler)
+            }
+        }
+        return tasks.compactMap { scheduled[$0.id] }
     }
 }
