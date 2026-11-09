@@ -12,11 +12,14 @@
 
 <h1>Scedra Privacy Policy</h1>
 
-<p><strong>Effective Date:</strong> September 30, 2026</p>
+<p><strong>Effective Date:</strong> November 9, 2026</p>
 
 <p>
 Scedra is a scheduling and productivity app that helps users create calendar
-events, organize tasks, calculate travel time, and plan their day.
+events, organize tasks, calculate travel time, and plan their day. Scedra
+does not require an account. It has no Scedra server and does not send your
+schedule to a separate AI provider. Parsing an appointment and reading text
+from a photo happen on the device.
 </p>
 
 <h2>Information Scedra Accesses</h2>
@@ -27,22 +30,12 @@ access:
 </p>
 
 <ul>
-  <li><strong>Calendar information</strong> to view, create, and edit events.</li>
-
-  <li><strong>Location information</strong> to calculate travel times and
-  determine when you should leave for an event.</li>
-
-  <li><strong>Photos and screenshots</strong> that you choose to provide so
-  Scedra can identify appointment and scheduling information.</li>
-
-  <li><strong>Microphone and speech recognition</strong> when you choose to
-  create an event using your voice.</li>
-
-  <li><strong>Contacts</strong> when you choose to use contact information to
-  help complete event details or locations.</li>
-
-  <li><strong>Tasks and scheduling information</strong> that you enter into
-  the app.</li>
+  <li><strong>Calendar information</strong> to view, create, and edit events, check overlaps, and save travel time.</li>
+  <li><strong>Location information</strong> to find a nearby place you named and to calculate travel time and when to leave.</li>
+  <li><strong>Photos and screenshots</strong> that you choose to provide so Scedra can read appointment text on the device.</li>
+  <li><strong>Microphone and speech recognition</strong> when you choose to create an event using your voice.</li>
+  <li><strong>Tasks, notes, and scheduling details</strong> that you enter, including a home address, saved places, and a name used only for the greeting.</li>
+  <li><strong>Notifications</strong> so Scedra can remind you locally when it is time to leave or when a plan suggests staying out.</li>
 </ul>
 
 <h2>How Information Is Used</h2>
@@ -53,41 +46,252 @@ creating and editing calendar events, organizing tasks, calculating travel
 time, detecting scheduling conflicts, and preparing navigation options.
 </p>
 
-<h2>Third-Party Services</h2>
+<h3>Information that stays on the device</h3>
 
 <p>
-Scedra may interact with services you choose to use, including Apple Calendar,
-Apple Maps, Google Maps, and Waze. Information handled by those services is
-subject to their respective privacy policies.
+The following stay on your iPhone unless a section below says they are sent
+to a service you use:
 </p>
 
-<!-- IMPORTANT:
-If Scedra sends text, screenshots, voice transcripts, calendar data,
-locations, or other information to an AI provider, server, analytics service,
-or other external API, add that service and explain what data is sent and why.
--->
-
-<h2>Data Sharing</h2>
+<ul>
+  <li>Tasks, including titles, notes, places, and coordinates used for travel. They are stored in the app’s local settings. You can delete a task in the Tasks tab. A completed task is removed about 24 hours after it is completed, and a calendar event Scedra created for that task can be removed at the same time.</li>
+  <li>Your greeting name, home address, other saved places, travel preferences, and profile notes.</li>
+  <li>A photo you chose for an appointment, saved in the app so you can view the original later, and the wording Scedra read or you typed. Deleting that event in Scedra removes this local copy.</li>
+  <li>A recent location fix, kept for up to seven days so a later place search can start near where you were. Scedra asks for location only while you are using the app.</li>
+  <li>Places you have confirmed, remembered on the device to make the next match easier.</li>
+  <li>Local notifications. A leave reminder can name the destination. A home-gap reminder can include the suggestion and items you asked to be reminded to bring. These are scheduled by iOS on the device. Scedra does not use a remote push service.</li>
+  <li>Your analytics choice, and, if you allow analytics, an anonymous identifier created on the device.</li>
+</ul>
 
 <p>
-Scedra does not sell users' personal information.
+Scedra does not use its own cloud database. If you back up your iPhone,
+on-device app data can be included in that iCloud or computer backup until
+you delete the backup.
 </p>
 
-<h2>Permissions</h2>
+<h3>Information sent to Apple</h3>
 
 <p>
-Scedra requests permission before accessing protected information such as your
-calendar, location, microphone, photos, or contacts. You can change these
-permissions at any time through the iOS Settings app. Some features may not
-work if the required permission is disabled.
+<strong>Calendar.</strong> Events you save are written to the calendar you
+select through Apple’s calendar software. The event can include the title,
+place, coordinates, times, travel notes, and the original wording (what you
+typed, the speech transcript, or text read from a photo). That calendar may
+then sync through the account behind it, such as iCloud, Google, or
+Exchange. Those providers handle the event under their own policies.
+Deleting Scedra does not delete events already saved to a calendar.
 </p>
 
-<h2>Data Retention</h2>
+<p>
+<strong>Maps.</strong> Place search, address lookup, and travel-time
+calculation use Apple Maps. Scedra sends Apple the place name or address and
+the coordinates needed to search or to route. That can include your current
+or recent location, your saved home address, and the destination. Apple’s
+handling of that information is described in
+<a href="https://www.apple.com/legal/privacy/">Apple’s Privacy Policy</a>.
+</p>
 
 <p>
-Calendar events saved through Scedra are stored in your Apple Calendar and
-remain there until they are edited or deleted. Other information is retained
-only as necessary to provide Scedra's features.
+<strong>Speech.</strong> When you dictate an appointment, Scedra uses Apple’s
+speech recognition and does not limit it to on-device recognition. The audio
+may be sent to Apple so Apple can return a transcript. Apple describes how
+it handles speech in its privacy policy. The transcript is used in Scedra
+and, if you save the event, can be stored in the calendar notes and in the
+local copy described above. It is not sent to PostHog.
+</p>
+
+<p>
+<strong>Photos.</strong> Text recognition uses Apple’s on-device Vision
+framework. Scedra does not upload the photo to Scedra or to PostHog. If the
+photo is stored in iCloud Photos, iOS may download it to the phone so Scedra
+can read it.
+</p>
+
+<h3>Navigation you choose to open</h3>
+
+<p>
+If you open directions in Apple Maps, Google Maps, or Waze, Scedra passes
+the destination coordinates to that app or website so it can start
+navigation. Apple Maps also receives the place name. Scedra does not receive
+information back. Google and Waze handle what they receive under
+<a href="https://policies.google.com/privacy">Google’s Privacy Policy</a>
+and the <a href="https://www.waze.com/legal/privacy">Waze Privacy Policy</a>.
+</p>
+
+<h2>Analytics and PostHog</h2>
+
+<p>
+Scedra uses PostHog to understand app usage and improve its features.
+Analytics is sent only after you allow it. PostHog then processes that
+information for Scedra. The project host is
+<code>https://us.i.posthog.com</code>, so this processing happens in the
+United States. If you use Scedra from outside the United States, allowing
+analytics sends this information to the United States.
+</p>
+
+<p>
+Scedra does not use PostHog session replay. Scedra does not use PostHog
+surveys, and it does not automatically record screen names or taps. PostHog
+is not used for advertising.
+</p>
+
+<h3>What is sent</h3>
+
+<p>
+Each analytics event can include:
+</p>
+
+<ul>
+  <li>The event name, such as app opened, onboarding started or completed, scheduling started, completed, or failed, event created, edited, or deleted, location search started, completed, or failed, location options shown or chosen, travel-time calculation started, completed, or failed, drive time added, task created, viewed, completed, or deleted, and on-device text processing started, completed, or failed.</li>
+  <li>Whether the step succeeded, how many milliseconds it took, and a short error category such as “missing time” or “calendar access.” The category is not the text of an error message.</li>
+  <li>The input method, such as typing, voice, or photo. This is the method only, not the words, audio, or picture.</li>
+  <li>Travel mode, such as drive, transit, or walk; whether travel time was requested; and whether a scheduling conflict was detected.</li>
+  <li>Whether a place search found a match, whether more than one option was shown, an option count capped at five, and whether a match was selected automatically. Place names, addresses, and coordinates are not included.</li>
+  <li>The calendar permission result: the kind of access and whether it was granted.</li>
+  <li>The kind of on-device processing, such as reading a schedule from text or reading text from a photo. The text and the photo are not included.</li>
+  <li>Whether that build of the app is production or development.</li>
+  <li>The time of the event.</li>
+  <li>Operating system, operating system version, app version, app build number, and device type, such as iPhone. Your phone’s name is not sent.</li>
+  <li>An anonymous identifier that the PostHog software creates and stores on the device, used to recognize repeat use of the same installation. Scedra does not send your name or email and does not attach this identifier to your calendar or tasks.</li>
+</ul>
+
+<p>
+Analytics does not include calendar titles or notes, task text, addresses,
+place names, GPS coordinates, voice, photos, contacts, or your phone’s name.
+</p>
+
+<p>
+The events Scedra builds do not include your IP address or a city or country.
+The delivery to PostHog still uses the internet, so PostHog can see the IP
+address of that connection. Scedra does not turn off PostHog’s location
+lookup. Unless that lookup is disabled in the PostHog project, PostHog may
+store an approximate location, such as country or city, derived from the IP
+address. PostHog may also store the IP address itself unless the project is
+set to discard it. Discarding the stored IP address does not, by itself, stop
+the approximate location from being stored. Scedra does not use that IP
+address or approximate location in the app.
+</p>
+
+<p>
+PostHog keeps an anonymous profile for the installation so later events can
+be tied to the same identifier. That profile is not your name or email. It
+can include the device fields above and, if PostHog’s location lookup is on,
+the approximate location described above.
+</p>
+
+<p>
+More information is available in
+<a href="https://posthog.com/privacy">PostHog’s Privacy Policy</a>.
+</p>
+
+<h2>Your Analytics Choice</h2>
+
+<p>
+When you first open Scedra, you are asked whether to allow analytics with
+PostHog. Analytics remains disabled unless you explicitly choose “Yes,
+allow.” Choosing “No thanks” or closing the consent prompt leaves analytics
+disabled. Your choice is saved on the device, and declining does not restrict
+access to Scedra’s features.
+</p>
+
+<p>
+You can enable or disable analytics at any time within Scedra → Settings →
+Privacy → Share analytics with PostHog. This control is inside Scedra,
+separate from Apple’s iOS Settings. Changes take effect without restarting
+the app.
+</p>
+
+<p>
+Enabling analytics allows collection from that point forward. Activity from
+before consent or while analytics was disabled is not uploaded later.
+Disabling analytics stops future collection and discards analytics that had
+not yet been sent. It does not automatically delete information PostHog has
+already received. See “Data Retention and Deletion” below to request
+deletion.
+</p>
+
+<h2>Third-Party Services and Data Sharing</h2>
+
+<p>
+Scedra may interact with services you choose to use, including Apple
+Calendar, Apple Maps, Apple speech recognition, Google Maps, and Waze.
+Information handled by those services is subject to their respective privacy
+policies, linked above where a public policy is available.
+</p>
+
+<p>
+If you allow analytics, Scedra shares the analytics information described
+above with PostHog, hosted in the United States, to understand app usage and
+improve the app. PostHog processes that information for Scedra. Scedra does
+not send calendar contents, task text, photos, voice audio, or precise
+location to PostHog.
+</p>
+
+<p>
+Scedra does not sell users’ personal information. Scedra does not share user
+information with other service providers for their own advertising.
+</p>
+
+<h2>Permissions and Privacy Choices</h2>
+
+<p>
+Scedra requests permission before accessing protected information where iOS
+requires authorization. You can change calendar, location, microphone, speech
+recognition, photos, and notification permissions through the iOS Settings
+app. Some features may not work if the required permission is disabled.
+</p>
+
+<p>
+Device permissions and analytics preferences are separate. To change
+analytics consent, open Scedra → Settings → Privacy → Share analytics with
+PostHog.
+</p>
+
+<h2>Data Retention and Deletion</h2>
+
+<p>
+Calendar events saved through Scedra are stored in your selected calendar and
+remain until edited or deleted, subject to that calendar account. Deleting
+Scedra does not automatically delete events already saved to a calendar.
+</p>
+
+<p>
+Tasks and other app data described above as staying on the device remain
+there until you delete them, until Scedra removes a completed task about 24
+hours after completion, or until you delete the app. Deleting the app removes
+Scedra’s on-device data, including tasks, settings, saved photos, local
+copies of appointment wording, the recent location fix, and the anonymous
+analytics identifier. A backup of the phone made before that deletion can
+still contain a copy until you delete the backup. Information already stored
+by a calendar provider, Apple, Google, Waze, or PostHog is not removed by
+deleting the app.
+</p>
+
+<p>
+Scedra does not keep its own copy of analytics events. PostHog stores them
+in the United States for the retention period on Scedra’s PostHog project,
+and an expired event can remain until PostHog’s later deletion cycle.
+Scedra does not set that period inside the app. Under PostHog’s published
+plan defaults, the period is 1 year on the Free plan and 2 years on a paid
+plan started on or after November 5, 2026. A paid organization that was
+already on a paid plan before that date may still retain events for up to 7
+years until the plan changes. Scedra does not use session replay, so there
+are no session recordings to retain.
+</p>
+
+<p>
+Scedra does not offer user accounts, so there is no in-app account deletion.
+</p>
+
+<p>
+You can contact <a href="mailto:charlotte@appenzeller.net">charlotte@appenzeller.net</a>
+to request deletion of information held by Scedra. Analytics records are tied
+to the anonymous identifier stored in the app. That identifier is not shown
+in Settings, and analytics are not tied to your name or email, so an email
+alone usually does not identify which records are yours. If the records can
+be matched to the request, Scedra will delete them within 30 days. Scedra
+does not delete records it cannot identify. Scedra may also keep information
+when the law requires it. Turning analytics off, or deleting the app, does
+not by itself delete events PostHog has already stored.
 </p>
 
 <h2>Security</h2>
@@ -101,15 +305,18 @@ be completely secure.
 <h2>Changes to This Privacy Policy</h2>
 
 <p>
-This Privacy Policy may be updated as Scedra changes. Any updates will be
-reflected on this page with a revised effective date.
+This Privacy Policy may be updated as Scedra changes. Updates will be
+reflected on this page with a revised effective date. If a change starts a
+new kind of collection that needs consent, or sends information to a new
+service, Scedra will ask in the app before that collection or sharing begins.
+Analytics stays off until you allow it.
 </p>
 
 <h2>Contact</h2>
 
 <p>
-For questions about this Privacy Policy or Scedra, contact:
-<a href="mailto:YOUR_EMAIL_HERE">charlotte@appenzeller.net</a>
+For questions about this Privacy Policy or Scedra, contact
+<a href="mailto:charlotte@appenzeller.net">charlotte@appenzeller.net</a>.
 </p>
 
 </body>
